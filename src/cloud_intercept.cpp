@@ -2615,8 +2615,14 @@ static void UploadLuaOnShutdown() {
         localFiles.size(), cloudManifest.size());
 }
 
-// Expected Steam client version -- patches and RVAs are only valid for this build
-static constexpr uint64_t EXPECTED_STEAM_VERSION = 1773426488ULL;
+// Supported Steam client versions -- patches and RVAs are only valid for these builds. Index 0 is the newest.
+static constexpr uint64_t SUPPORTED_STEAM_VERSIONS[] = { 1777411435ULL, 1773426488ULL };
+
+static bool IsSupportedSteamVersion(uint64_t v) {
+    for (uint64_t s : SUPPORTED_STEAM_VERSIONS)
+        if (v == s) return true;
+    return false;
+}
 
 static uint64_t ReadSteamVersion(const std::string& steamDir) {
     std::string manifest = steamDir + "package\\steam_client_win64.manifest";
@@ -2629,7 +2635,7 @@ static uint64_t ReadSteamVersion(const std::string& steamDir) {
         if (start == std::string::npos) continue;
         std::string_view sv(line.data() + start, line.size() - start);
         if (sv.substr(0, 9) != "\"version\"") continue;
-        // format: "version"		"1773426488"
+        // format: "version"		"1777411435"
         auto last = sv.rfind('"');
         if (last == std::string_view::npos || last == 0) continue;
         auto secondLast = sv.rfind('"', last - 1);
@@ -2766,10 +2772,11 @@ void Init(const std::string& steamPath) {
             "CloudRedirect -- Version Unknown",
             MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
         return;
-    } else if (detectedVersion != EXPECTED_STEAM_VERSION) {
-        bool steamIsNewer = detectedVersion > EXPECTED_STEAM_VERSION;
-        LOG("FATAL: Steam version mismatch! expected=%llu actual=%llu (%s)",
-            EXPECTED_STEAM_VERSION, detectedVersion,
+    } else if (!IsSupportedSteamVersion(detectedVersion)) {
+        constexpr uint64_t newestSupported = SUPPORTED_STEAM_VERSIONS[0];
+        bool steamIsNewer = detectedVersion > newestSupported;
+        LOG("FATAL: Steam version mismatch! supported_newest=%llu actual=%llu (%s)",
+            newestSupported, detectedVersion,
             steamIsNewer ? "Steam is newer" : "Steam is older");
 
         char msg[512];
@@ -2779,14 +2786,14 @@ void Init(const std::string& steamPath) {
                 "CloudRedirect supports (version %llu).\n\n"
                 "Update CloudRedirect to match your Steam version.\n\n"
                 "CloudRedirect will NOT activate.",
-                detectedVersion, EXPECTED_STEAM_VERSION);
+                detectedVersion, newestSupported);
         } else {
             snprintf(msg, sizeof(msg),
                 "Your Steam client (version %llu) is older than what "
                 "CloudRedirect expects (version %llu).\n\n"
                 "Update Steam to match your CloudRedirect version.\n\n"
                 "CloudRedirect will NOT activate.",
-                detectedVersion, EXPECTED_STEAM_VERSION);
+                detectedVersion, newestSupported);
         }
 
         MessageBoxA(nullptr, msg, "CloudRedirect -- Version Mismatch",

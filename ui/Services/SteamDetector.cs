@@ -15,9 +15,18 @@ public static class SteamDetector
     private static string? _cachedPath;
 
     /// <summary>
-    /// The exact Steam client version our patches and RVAs target.
+    /// Supported Steam client versions our patches and RVAs target. Index 0 is the newest.
     /// </summary>
-    public const long ExpectedSteamVersion = 1773426488;
+    public static readonly long[] SupportedSteamVersions = { 1777411435, 1773426488 };
+
+    public static long ExpectedSteamVersion => SupportedSteamVersions[0];
+
+    public static bool IsSupportedSteamVersion(long version)
+    {
+        foreach (var v in SupportedSteamVersions)
+            if (v == version) return true;
+        return false;
+    }
 
     /// <summary>
     /// Returns the Steam installation directory, or null if not found.
@@ -86,7 +95,7 @@ public static class SteamDetector
                 var trimmed = line.Trim();
                 if (!trimmed.StartsWith("\"version\""))
                     continue;
-                // format: "version"		"1773426488"
+                // format: "version"		"1777411435"
                 var last = trimmed.LastIndexOf('"');
                 var secondLast = trimmed.LastIndexOf('"', last - 1);
                 if (last > secondLast && secondLast >= 0)

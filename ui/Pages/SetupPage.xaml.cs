@@ -407,7 +407,7 @@ public partial class SetupPage : Page
             return;
         }
 
-        if (version.Value == SteamDetector.ExpectedSteamVersion)
+        if (SteamDetector.IsSupportedSteamVersion(version.Value))
         {
             VersionStatusText.Text = S.Format("Setup_VersionSupported", version.Value);
             VersionIcon.Symbol = Wpf.Ui.Controls.SymbolRegular.CheckmarkCircle24;

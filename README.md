@@ -41,7 +41,7 @@ CloudRedirect consists of a C++ DLL and a WPF companion app:
 
 ## Usage
 
-Make sure you are on Steam version 1773426488. That is the only supported version of Steam.
+Make sure you are on Steam version 1777411435 or 1773426488. Those are the only supported versions of Steam.
 
 Grab the latest release from the [Releases page](https://github.com/Selectively11/CloudRedirect/releases).
 
