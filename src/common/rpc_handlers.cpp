@@ -970,17 +970,6 @@ PB::Writer HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& req
         return body;
     }
     uint64_t appKey = MakeAppAccountKey(accountId, appId);
-    bool useCommittedLocalInventory = false;
-    std::vector<LocalStorage::FileEntry> committedFiles;
-    uint64_t committedChangeNumber = 0;
-
-    SetRpcCrashContext("GetChangelist:interrupted-inventory", "Cloud.GetAppFileChangelist#1", appId);
-    useCommittedLocalInventory = CloudStorage::TryBuildCommittedInventoryForInterruptedUpload(
-        accountId, appId, committedFiles, committedChangeNumber);
-    if (useCommittedLocalInventory) {
-        LOG("[NS-CL] app %u preserving committed inventory during interrupted upload recovery",
-            appId);
-    }
 
     // Track whether we fetched fresh manifest from cloud this call
     CloudStorage::Manifest cloudManifest;
@@ -989,7 +978,7 @@ PB::Writer HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& req
 
     // Fetch cloud CN and manifest to ensure we return accurate file metadata.
     // Steam compares SHA/timestamps from our response against its local cache.
-    if (!useCommittedLocalInventory && CloudStorage::IsCloudActive()) {
+    if (CloudStorage::IsCloudActive()) {
         SetRpcCrashContext("GetChangelist:cloud-cn", "Cloud.GetAppFileChangelist#1", appId);
         uint64_t localCN = LocalStorage::GetChangeNumber(accountId, appId);
         cloudCN = CloudStorage::FetchCloudCN(accountId, appId);
@@ -1118,17 +1107,33 @@ PB::Writer HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& req
     AutoCloudBootstrap::Bootstrap(accountId, appId, /*wait=*/false);
     bool bootstrapActive = AutoCloudBootstrap::IsActive(accountId, appId);
 
+    // Publish local data when cloud has no CN. Skipped while bootstrap is active
+    // so AutoCloud imports land in the published manifest.
+    if (CloudStorage::IsCloudActive() && cloudCN == 0 && !bootstrapActive) {
+        SetRpcCrashContext("GetChangelist:promote-local", "Cloud.GetAppFileChangelist#1", appId);
+        uint64_t localCN = LocalStorage::GetChangeNumber(accountId, appId);
+        if (localCN > 0) {
+            CloudStorage::Manifest fullManifest =
+                CloudStorage::BuildManifestFromLocalBlobs(accountId, appId);
+            size_t nonReserved = 0;
+            for (const auto& [name, entry] : fullManifest) {
+                if (!IsReservedBlobFilename(name)) ++nonReserved;
+            }
+            if (nonReserved > 0) {
+                LOG("[NS-CL] No cloud CN for app %u, publishing %zu local files at CN=%llu",
+                    appId, nonReserved, localCN);
+                if (CloudStorage::SaveManifest(accountId, appId, fullManifest)) {
+                    CloudStorage::CommitCNAsync(accountId, appId, localCN);
+                }
+            }
+        }
+    }
+
     // Build file list - either from cloud manifest (fast path) or local blobs
     std::vector<LocalStorage::FileEntry> files;
     uint64_t serverChangeNumber = 0;  // Initialize to prevent UB in edge cases
     
-    if (useCommittedLocalInventory) {
-        SetRpcCrashContext("GetChangelist:committed-files", "Cloud.GetAppFileChangelist#1", appId);
-        serverChangeNumber = committedChangeNumber;
-        files = committedFiles;
-        LOG("[NS-CL] GetAppFileChangelist app=%u using committed local manifest during interrupted upload (%zu files)",
-            appId, files.size());
-    } else if (haveCloudManifest && !cloudManifest.empty()) {
+    if (haveCloudManifest && !cloudManifest.empty()) {
         SetRpcCrashContext("GetChangelist:manifest-delta", "Cloud.GetAppFileChangelist#1", appId);
         // Steam-faithful delta: compute diff between clientCN snapshot and current manifest.
         // Steam's server returns only changed files — not the full inventory.
