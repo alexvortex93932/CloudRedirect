@@ -1020,11 +1020,11 @@ PB::Writer HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& req
                         LOG("[NS-CL] Got cloud manifest with %zu files for app %u",
                             cloudManifest.size(), appId);
                         haveCloudManifest = true;
-                        LocalStorage::SetChangeNumber(accountId, appId, cloudCN);
-                        UpdateRemotecacheVdfChangeNumber(accountId, appId, cloudCN);
-                        if (repairStatus == CloudStorage::ManifestRepairStatus::Complete &&
-                            !CloudStorage::SaveManifestLocal(accountId, appId, cloudManifest)) {
-                            LOG("[NS-CL] Failed to persist local cloud manifest for app %u", appId);
+                        if (CloudStorage::SaveManifestLocal(accountId, appId, cloudManifest)) {
+                            LocalStorage::SetChangeNumber(accountId, appId, cloudCN);
+                            UpdateRemotecacheVdfChangeNumber(accountId, appId, cloudCN);
+                        } else {
+                            LOG("[NS-CL] Failed to persist local cloud manifest for app %u — CN not advanced", appId);
                         }
                     } else if (cloudManifest.empty()) {
                         LOG("[NS-CL] Cloud manifest is empty but local has %zu blobs for app %u; falling back to local inventory",
@@ -1214,7 +1214,6 @@ PB::Writer HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& req
         }
     }
     if (rootTokens.empty()) {
-        // No stored root tokens — derive from AutoCloud rules in appinfo.vdf.
         std::string steamPath = CloudIntercept::GetSteamPath();
         if (!steamPath.empty()) {
             auto scanResult = AutoCloudScan::GetFileList(steamPath, accountId, appId);
@@ -1223,7 +1222,7 @@ PB::Writer HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& req
             }
             // No files on disk — fall back to rule-level root tokens
             if (rootTokens.empty()) {
-                rootTokens = scanResult.ruleRootTokens;
+                rootTokens = std::move(scanResult.ruleRootTokens);
             }
         }
         if (rootTokens.empty()) {
