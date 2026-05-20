@@ -190,19 +190,8 @@ static void DoInit()
     {
         DebugLog("[CR] DoInit: FAILED - transport vtable not found\n");
         Log::Error("Init failed: transport vtable not found");
-        Notify("Incompatible Steam client — hooks disabled", true);
+        Notify("Incompatible Steam client - hooks disabled", true);
         return;
-    }
-
-    // Validate slot pointers are within steamclient's address range
-    for (int slot : {5, 7, 8}) {
-        uintptr_t fn = reinterpret_cast<uintptr_t>(vtable[slot]);
-        if (fn < steamBase || fn >= steamBase + steamSize) {
-            DebugLog("[CR] DoInit: FAILED - vtable slot points outside steamclient\n");
-            Log::Error("Init failed: slot %d (%p) outside steamclient range, incompatible client", slot, (void*)fn);
-            Notify("Incompatible Steam client — hooks disabled", true);
-            return;
-        }
     }
 
     DebugLog("[CR] DoInit: saving originals\n");
@@ -386,12 +375,10 @@ static void* DeferredInitThread(void*)
     // Poll for steamclient.so — under LD_PRELOAD we load before Steam has
     // mapped steamclient, so a fixed delay is insufficient.
     DebugLog("[CR] DeferredInit: waiting for steamclient.so\n");
-    for (int i = 0; i < 120; i++) {  // up to 60 seconds
+    for (int i = 0; i < 240; i++) {  // up to 120 seconds
         if (SteamclientMapped()) break;
         usleep(500000);
     }
-    // Extra settle time for relocations to complete
-    usleep(1000000);
     DebugLog("[CR] DeferredInit: starting\n");
 
     // Install crash guard so a bad memory read aborts correctly
@@ -407,8 +394,8 @@ static void* DeferredInitThread(void*)
         DoInit();
     } else {
         DebugLog("[CR] DeferredInit: CRASHED during init, aborting safely\n");
-        Log::Error("Caught signal during init — incompatible steamclient? Hooks NOT installed.");
-        Notify("Crashed during init — hooks disabled", true);
+        Log::Error("Caught signal during init - incompatible steamclient? Hooks NOT installed.");
+        Notify("Crashed during init - hooks disabled", true);
     }
     g_inScan = 0;
 

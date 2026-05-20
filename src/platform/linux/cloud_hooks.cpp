@@ -209,7 +209,7 @@ static bool ParseIntoMessage(void* msg, const uint8_t* data, size_t len) {
     return g_parseFromArray(msg, data, (int)len) != 0;
 }
 
-static std::optional<PB::Writer> DispatchCloudRpc(
+static std::optional<CloudIntercept::RpcResult> DispatchCloudRpc(
     const char* method, uint32_t appId, const std::vector<PB::Field>& reqBody) {
     using namespace CloudIntercept;
     if (strcmp(method, RPC_GET_CHANGELIST) == 0)    return HandleGetChangelist(appId, reqBody);
@@ -366,13 +366,14 @@ extern "C" int hook_BYieldingSend(void* pThis, const char* methodName, void* req
     if (!dispatched.has_value()) {
         return origFn(pThis, methodName, request, response, flags);
     }
+    auto& result = *dispatched;
 
-    LOG("[Hook] INTERCEPT BYieldingSend %s app=%u -> %zu bytes",
-        methodName, appId, dispatched->Size());
+    LOG("[Hook] INTERCEPT BYieldingSend %s app=%u -> %zu bytes, eresult=%d",
+        methodName, appId, result.body.Size(), result.eresult);
 
 #ifdef DEBUG_HEX_DUMP
     {
-        auto& d = dispatched->Data();
+        auto& d = result.body.Data();
         std::string hex;
         for (size_t i = 0; i < d.size() && i < 64; i++) {
             char tmp[4]; snprintf(tmp, sizeof(tmp), "%02X ", d[i]);
@@ -383,9 +384,9 @@ extern "C" int hook_BYieldingSend(void* pThis, const char* methodName, void* req
 #endif
 
     // Parse response bytes into the response protobuf object
-    if (response && dispatched->Size() > 0) {
+    if (response && result.body.Size() > 0) {
         CR_SetCrashContext("BYieldingSend:parse-response", methodName, appId);
-        if (!ParseIntoMessage(response, dispatched->Data().data(), dispatched->Size())) {
+        if (!ParseIntoMessage(response, result.body.Data().data(), result.body.Size())) {
             LOG("[Hook] BYieldingSend %s: ParseFromArray failed for response! Falling through.",
                 methodName);
             return origFn(pThis, methodName, request, response, flags);
@@ -393,10 +394,10 @@ extern "C" int hook_BYieldingSend(void* pThis, const char* methodName, void* req
         LOG("[Hook]   ParseFromArray succeeded");
     }
 
-    // Set flags to indicate success
+    // Flags layout: [0]=routing, [1]=mode, [2]=transport_success, [3]=eresult
     if (flags) {
         flags[2] = 1;  // transport success
-        flags[3] = 1;  // eresult = k_EResultOK
+        flags[3] = result.eresult;
     }
 
     LOG("[Hook]   returning success for %s app=%u", methodName, appId);
@@ -532,12 +533,14 @@ extern "C" int hook_SyncSend2(void* pThis, const char* methodName, void* buf, un
     if (!dispatched.has_value()) {
         return origFn(pThis, methodName, buf, bufLen, response, flags);
     }
+    auto& result = *dispatched;
 
-    LOG("[Hook] INTERCEPT SyncSend2 %s app=%u -> %zu bytes", methodName, appId, dispatched->Size());
+    LOG("[Hook] INTERCEPT SyncSend2 %s app=%u -> %zu bytes, eresult=%d",
+        methodName, appId, result.body.Size(), result.eresult);
 
-    if (response && dispatched->Size() > 0 && g_parseFromArray) {
+    if (response && result.body.Size() > 0 && g_parseFromArray) {
         CR_SetCrashContext("SyncSend2:parse-response", methodName, appId);
-        if (!ParseIntoMessage(response, dispatched->Data().data(), dispatched->Size())) {
+        if (!ParseIntoMessage(response, result.body.Data().data(), result.body.Size())) {
             LOG("[Hook] SyncSend2 %s: ParseFromArray failed", methodName);
             return origFn(pThis, methodName, buf, bufLen, response, flags);
         }
@@ -546,7 +549,7 @@ extern "C" int hook_SyncSend2(void* pThis, const char* methodName, void* buf, un
     // Flags layout (from IDA): [0]=routing, [1]=mode, [2]=transport_success, [3]=eresult
     if (flags) {
         flags[2] = 1;  // transport success
-        flags[3] = 1;  // eresult = k_EResultOK
+        flags[3] = result.eresult;
     }
 
     return 1;

@@ -953,7 +953,7 @@ static std::string GetMachineName() {
 
 
 // Returns the blob-store file list; Steam compares vs. remotecache.vdf.
-PB::Writer HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqBody) {
+RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqBody) {
     SetRpcCrashContext("GetChangelist:entry", "Cloud.GetAppFileChangelist#1", appId);
     auto* cnField = PB::FindField(reqBody, 2);
     uint64_t clientChangeNumber = cnField ? cnField->varintVal : 0;
@@ -1737,7 +1737,7 @@ static bool MergeStatsFile(uint32_t appId, uint32_t accountId,
 
 // SignalAppLaunchIntent: return pending_remote_operations.
 // No cloud sync here; Steam fetches files on-demand via ClientFileDownload.
-PB::Writer HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqBody) {
+RpcResult HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqBody) {
     LOG("[NS] SignalAppLaunchIntent app=%u", appId);
 
     RecordLaunchTime(appId);
@@ -1776,15 +1776,19 @@ PB::Writer HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqB
 
     // Cloud session management -- sync already happened in HandleGetChangelist.
     PB::Writer body;
+    bool sessionConflict = false;
     if (CloudStorage::IsCloudActive()) {
         auto stateResult = CloudStorage::FetchCloudState(accountId, appId);
         if (stateResult.status == CloudStorage::StateFetchStatus::Ok) {
             auto& state = stateResult.state;
             uint64_t now = static_cast<uint64_t>(time(nullptr));
 
-            if (state.hasActiveSession() && !state.isSessionStale(now) &&
-                state.session.clientId != currentSession.clientId &&
-                !ignorePendingOperations) {
+            if (state.hasActiveSession() &&
+                state.session.clientId != currentSession.clientId) {
+                // Another machine holds the session lock.
+                // No stale timeout -- Steam shows the conflict dialog regardless
+                // of session age. "Play Anyway" (ignore_pending_operations=true)
+                // is the recovery path for crashed/orphaned sessions.
                 LOG("[NS] LaunchIntent app=%u: another session active (machine=%s, client=%llu, age=%llus)",
                     appId, state.session.machineName.c_str(),
                     state.session.clientId,
@@ -1795,6 +1799,21 @@ PB::Writer HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqB
                 op.WriteVarint(3, state.session.clientId);
                 op.WriteVarint(4, static_cast<uint32_t>(state.session.timeLastUpdated));
                 body.WriteSubmessage(1, op);
+
+                if (!ignorePendingOperations) {
+                    // Steam expects EResult=108 to trigger the conflict UI.
+                    sessionConflict = true;
+                } else {
+                    // User chose "play anyway" -- acquire the lock, overriding
+                    // the other session.
+                    state.session.clientId = currentSession.clientId;
+                    state.session.machineName = currentSession.machineName;
+                    state.session.timeLastUpdated = now;
+                    state.session.operation = "active";
+                    CloudStorage::PublishCloudState(accountId, appId, state, stateResult.etag);
+                    LOG("[NS] LaunchIntent app=%u: forced session override (machine=%s, client=%llu)",
+                        appId, currentSession.machineName.c_str(), currentSession.clientId);
+                }
             } else {
                 state.session.clientId = currentSession.clientId;
                 state.session.machineName = currentSession.machineName;
@@ -1820,10 +1839,10 @@ PB::Writer HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqB
         if (entry.deviceType != 0) op.WriteVarint(6, entry.deviceType);
         body.WriteSubmessage(1, op);
     }
-    return body;
+    return RpcResult(std::move(body), sessionConflict ? kEResultDisabled : kEResultOK);
 }
 
-PB::Writer HandleSuspendSession(uint32_t appId, const std::vector<PB::Field>& reqBody) {
+RpcResult HandleSuspendSession(uint32_t appId, const std::vector<PB::Field>& reqBody) {
     LOG("[NS] SuspendAppSession app=%u", appId);
 
     uint32_t accountId = 0;
@@ -1848,7 +1867,7 @@ PB::Writer HandleSuspendSession(uint32_t appId, const std::vector<PB::Field>& re
     return PB::Writer();
 }
 
-PB::Writer HandleResumeSession(uint32_t appId, const std::vector<PB::Field>& reqBody) {
+RpcResult HandleResumeSession(uint32_t appId, const std::vector<PB::Field>& reqBody) {
     LOG("[NS] ResumeAppSession app=%u", appId);
 
     uint32_t accountId = 0;
@@ -1868,7 +1887,7 @@ PB::Writer HandleResumeSession(uint32_t appId, const std::vector<PB::Field>& req
 }
 
 // ClientGetAppQuotaUsage
-PB::Writer HandleQuotaUsage(uint32_t appId, const std::vector<PB::Field>& reqBody) {
+RpcResult HandleQuotaUsage(uint32_t appId, const std::vector<PB::Field>& reqBody) {
     uint32_t accountId = 0;
     if (!RequireAccountId("ClientGetAppQuotaUsage", appId, accountId)) {
         PB::Writer body;
@@ -1904,7 +1923,7 @@ PB::Writer HandleQuotaUsage(uint32_t appId, const std::vector<PB::Field>& reqBod
 }
 
 // BeginAppUploadBatch
-PB::Writer HandleBeginBatch(uint32_t appId, const std::vector<PB::Field>& reqBody) {
+RpcResult HandleBeginBatch(uint32_t appId, const std::vector<PB::Field>& reqBody) {
     uint64_t batchId = BatchTracker_NextId();
     uint32_t accountId = 0;
     if (!RequireAccountId("BeginAppUploadBatch", appId, accountId)) {
@@ -1947,7 +1966,7 @@ PB::Writer HandleBeginBatch(uint32_t appId, const std::vector<PB::Field>& reqBod
 
 // ClientBeginFileUpload
 // Tell Steam to PUT the file to our local HTTP server.
-PB::Writer HandleBeginFileUpload(uint32_t appId, const std::vector<PB::Field>& reqBody) {
+RpcResult HandleBeginFileUpload(uint32_t appId, const std::vector<PB::Field>& reqBody) {
     // extract request fields
     uint64_t fileSize = 0, rawFileSize = 0;
     std::string filename;
@@ -2031,7 +2050,7 @@ PB::Writer HandleBeginFileUpload(uint32_t appId, const std::vector<PB::Field>& r
 
 // ClientCommitFileUpload
 // The file has been PUT to our HTTP server. Update local metadata.
-PB::Writer HandleCommitFileUpload(uint32_t appId, const std::vector<PB::Field>& reqBody) {
+RpcResult HandleCommitFileUpload(uint32_t appId, const std::vector<PB::Field>& reqBody) {
     bool transferSucceeded = false;
     std::string filename;
 
@@ -2140,7 +2159,7 @@ PB::Writer HandleCommitFileUpload(uint32_t appId, const std::vector<PB::Field>& 
 }
 
 // CompleteAppUploadBatchBlocking
-PB::Writer HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqBody) {
+RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqBody) {
     auto completeInfo = CloudRpcUtils::ParseCompleteBatchRequest(reqBody);
 
     // Increment CN once per batch; cloud publish detached.
@@ -2253,7 +2272,7 @@ PB::Writer HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& req
 
 // ClientFileDownload
 // Tell Steam to GET the file from our local HTTP server.
-PB::Writer HandleFileDownload(uint32_t appId, const std::vector<PB::Field>& reqBody) {
+RpcResult HandleFileDownload(uint32_t appId, const std::vector<PB::Field>& reqBody) {
     std::string filename;
     for (auto& f : reqBody) {
         if (f.fieldNum == 2 && f.wireType == PB::LengthDelimited)
@@ -2298,20 +2317,6 @@ PB::Writer HandleFileDownload(uint32_t appId, const std::vector<PB::Field>& reqB
         }
     }
 
-    // is_explicit_delete lets Steam silently drop the file; 404 triggers a sync error UI
-    if (fileSize > 0) {
-        auto blobStatus = CloudStorage::CheckBlobExists(accountId, appId, cleanName);
-        if (blobStatus == ICloudProvider::ExistsStatus::Missing) {
-            LOG("[NS-DL] FileDownload app=%u file=%s: blob missing, returning is_explicit_delete=true",
-                appId, cleanName.c_str());
-            CloudStorage::RemoveManifestEntry(accountId, appId, cleanName);
-            PB::Writer body;
-            body.WriteVarint(1, appId);
-            body.WriteVarint(6, 1);              // is_explicit_delete = true
-            return body;
-        }
-    }
-
     LOG("[NS-DL] FileDownload app=%u file=%s (clean=%s) size=%llu -> %s%s",
         appId, filename.c_str(), cleanName.c_str(), fileSize, urlHost.c_str(), urlPath.c_str());
 
@@ -2336,7 +2341,7 @@ PB::Writer HandleFileDownload(uint32_t appId, const std::vector<PB::Field>& reqB
 }
 
 // ClientDeleteFile
-PB::Writer HandleDeleteFile(uint32_t appId, const std::vector<PB::Field>& reqBody) {
+RpcResult HandleDeleteFile(uint32_t appId, const std::vector<PB::Field>& reqBody) {
     std::string filename;
     for (auto& f : reqBody) {
         if (f.fieldNum == 2 && f.wireType == PB::LengthDelimited)

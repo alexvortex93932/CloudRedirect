@@ -52,7 +52,6 @@ struct CloudAppState {
     std::unordered_map<std::string, FileEntry> files;
 
     bool hasActiveSession() const;
-    bool isSessionStale(uint64_t nowUnix, uint64_t staleTimeoutSeconds = 600) const;
 };
 
 // Result of fetching state from cloud provider.

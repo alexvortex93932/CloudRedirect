@@ -207,18 +207,10 @@ static void HandleClient(SOCKET client) {
     int bodyReceived = total - headerEnd;
 
     if (_stricmp(method, "PUT") == 0) {
-        // PUT without Content-Length -> 411; body length is otherwise unbounded.
-        if (contentLength < 0) {
-            LOG("[HTTP] PUT %s -> REJECTED: no Content-Length header", path);
-            const char* response =
-                "HTTP/1.1 411 Length Required\r\n"
-                "Content-Length: 0\r\n"
-                "Connection: close\r\n"
-                "\r\n";
-            send(client, response, (int)strlen(response), 0);
-            closesocket(client);
-            return;
-        }
+        // Steam omits Content-Length for 0-byte files (LOCK, empty .log, etc.).
+        // Treat missing header as 0 bytes rather than rejecting.
+        if (contentLength < 0)
+            contentLength = 0;
 
         // PUT /upload/<appId>/<filename>
         int64_t maxBytes = g_maxUploadBytes.load();

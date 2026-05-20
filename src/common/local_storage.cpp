@@ -25,6 +25,7 @@ using CloudIntercept::kLegacyFileTokensFilename;
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <ctime>
@@ -1189,7 +1190,15 @@ bool WriteFileNoIncrement(uint32_t accountId, uint32_t appId, const std::string&
     }
 
     if (!FileUtil::AtomicWriteBinary(fullPath, data, len)) {
-        LOG("WriteFileNoIncrement failed: %s (%zu bytes)", fullPath.c_str(), len);
+#ifdef _WIN32
+        DWORD lastErr = GetLastError();
+        LOG("WriteFileNoIncrement failed: %s (%zu bytes, GetLastError=%lu)",
+            fullPath.c_str(), len, (unsigned long)lastErr);
+#else
+        int lastErr = errno;
+        LOG("WriteFileNoIncrement failed: %s (%zu bytes, errno=%d: %s)",
+            fullPath.c_str(), len, lastErr, strerror(lastErr));
+#endif
         return false;
     }
     LOG("WriteFileNoIncrement: app %u %s (%zu bytes)", appId, filename.c_str(), len);

@@ -1167,15 +1167,13 @@ static bool ParseBytesToBody(void* bodyObj, const uint8_t* data, size_t size) {
 }
 
 // SEH-safe header field writing
-static bool SEH_WriteResponseHeader(void* respHeader) {
+static bool SEH_WriteResponseHeader(void* respHeader, int32_t eresult = 1) {
     __try {
-        // Set eresult = 1 (k_EResultOK)
         *(uint32_t*)((uintptr_t)respHeader + 16) |= 0x20000000u;
-        *(int32_t*)((uintptr_t)respHeader + 216) = 1;  // eresult = OK
+        *(int32_t*)((uintptr_t)respHeader + 216) = eresult;
 
-        // Set the error_message related field (slot 5 does this too)
         *(uint32_t*)((uintptr_t)respHeader + 16) |= 0x40000000u;
-        *(int32_t*)((uintptr_t)respHeader + 220) = 0;  // no error
+        *(int32_t*)((uintptr_t)respHeader + 220) = 0;
         return true;
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG("[VtHook] EXCEPTION writing response header: code=0x%08X", GetExceptionCode());
@@ -1185,7 +1183,7 @@ static bool SEH_WriteResponseHeader(void* respHeader) {
 
 // Shared Cloud RPC dispatch - routes a method name to the appropriate handler.
 // Returns std::nullopt if the method is not a recognized Cloud RPC we handle.
-static std::optional<PB::Writer> DispatchCloudRpc(
+static std::optional<RpcResult> DispatchCloudRpc(
     const char* method, uint32_t appId, const std::vector<PB::Field>& reqBody) {
     if (strcmp(method, RPC_GET_CHANGELIST) == 0)       return HandleGetChangelist(appId, reqBody);
     if (strcmp(method, RPC_LAUNCH_INTENT) == 0)        return HandleLaunchIntent(appId, reqBody);
@@ -1266,22 +1264,18 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
     // Capture SteamID from request header if not already cached.
 
     // Call the appropriate handler to build a response body
-    PB::Writer responseBodyPB;
-
     auto dispatched = DispatchCloudRpc(methodName, realAppId, innerFields);
     if (!dispatched.has_value()) {
         LOG("[Slot4] Unhandled method %s, passing through", methodName);
         return g_originalSlot4(thisptr, methodName, requestBody, responseBody, flags);
     }
-    responseBodyPB = std::move(*dispatched);
+    auto& result = *dispatched;
 
-    LOG("[Slot4] %s: response body %zu bytes", methodName, responseBodyPB.Size());
+    LOG("[Slot4] %s: response body %zu bytes, eresult=%d", methodName, result.body.Size(), result.eresult);
 
     // Write the response body into the response protobuf object
-    if (responseBody && responseBodyPB.Size() > 0) {
-        if (!ParseBytesToBody(responseBody, responseBodyPB.Data().data(), responseBodyPB.Size())) {
-            // ParseBytesToBody may have partially modified the response object.
-            // Passing through to g_originalSlot4 with a corrupted response is unsafe.
+    if (responseBody && result.body.Size() > 0) {
+        if (!ParseBytesToBody(responseBody, result.body.Data().data(), result.body.Size())) {
             LOG("[Slot4] %s: ParseFromArray failed for response body! Returning transport failure.", methodName);
             return false;
         }
@@ -1289,12 +1283,12 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
 
     // Flags layout (from IDA decompilation of sub_138914710 / sub_138914A30):
     //   [0-1]: __int64 (routing/request context, leave untouched)
-    //   [2]:   int  - transport success flag (1 = OK, 0 = transport failure ΓåÆ triggers k_EResultTimeout=16)
-    //   [3]:   int  - eresult from response header (1 = k_EResultOK)
+    //   [2]:   int  - transport success flag (1 = OK, 0 = transport failure -> triggers k_EResultTimeout=16)
+    //   [3]:   int  - eresult from response header (1 = k_EResultOK, 108 = k_EResultDisabled)
     //   [4+]:  char[] - error message string (null-terminated)
     if (flags) {
         flags[2] = 1;  // transport_success = true (MUST be 1, or caller returns k_EResultTimeout!)
-        flags[3] = 1;  // eresult = k_EResultOK
+        flags[3] = result.eresult;
         flags[4] = 0;  // error_message = "" (null terminator)
     }
 
@@ -1406,16 +1400,14 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
     }
 
     // Call the appropriate handler to build a response body
-    PB::Writer responseBody;
-
     auto dispatched = DispatchCloudRpc(methodName, realAppId, innerFields);
     if (!dispatched.has_value()) {
         LOG("[VtHook] Unhandled method %s, passing through", methodName);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
-    responseBody = std::move(*dispatched);
+    auto& result = *dispatched;
 
-    LOG("[VtHook] %s: response body %zu bytes", methodName, responseBody.Size());
+    LOG("[VtHook] %s: response body %zu bytes, eresult=%d", methodName, result.body.Size(), result.eresult);
 
     // Validate response header BEFORE writing body to avoid corrupting the
     // response protobuf object on a failure path.
@@ -1432,42 +1424,38 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
-    if (responseBody.Size() > 0) {
-        if (!ParseBytesToBody(respBody, responseBody.Data().data(), responseBody.Size())) {
-            // ParseBytesToBody may have partially modified the response object.
-            // Passing through to g_originalSlot5 with a corrupted response is unsafe.
+    if (result.body.Size() > 0) {
+        if (!ParseBytesToBody(respBody, result.body.Data().data(), result.body.Size())) {
             LOG("[VtHook] %s: ParseFromArray failed for response body! Returning transport failure.", methodName);
             return false;
         }
     }
 
-    // Set eresult=1 in the response header (CProtoBufMsg+40):
-    //   has_bits |= 0x20000000 (eresult), |= 2 (target_job_name), |= 0x40000000 (error_message)
+    // Write eresult into response header (CProtoBufMsg+40):
+    //   has_bits |= 0x20000000 (eresult), |= 0x40000000 (error_message)
     //   header+216 = eresult, header+220 = error_code
-    if (!SEH_WriteResponseHeader(respHeader)) {
+    if (!SEH_WriteResponseHeader(respHeader, result.eresult)) {
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
-    LOG("[VtHook] Set response header: eresult=1, error=0");
+    LOG("[VtHook] Set response header: eresult=%d, error=0", result.eresult);
 
     // Populate flags output (caller reads in addition to the header).
     if (flags) {
         // flags layout (from slot 5):
-        //   flags[0] = int32_t routing_appid (slot 5 reads *(reqHeader+116) and writes to flags[0])
+        //   flags[0] = int32_t routing_appid
         //   flags[1] = int32_t (always 1, set in slot 5 constructor)
-        //   flags[2] = int32_t error_code ΓåÆ written to respHeader+220
-        //   flags[3] = int32_t eresult ΓåÆ written to respHeader+216
+        //   flags[2] = int32_t error_code -> written to respHeader+220
+        //   flags[3] = int32_t eresult -> written to respHeader+216
         //   flags[4..] = char[256] target_job_name
-        // flags is int64_t* but actual layout is int32_t[68].
-        // Use int32_t* cast to avoid zeroing adjacent fields.
         int32_t* f32 = reinterpret_cast<int32_t*>(flags);
         f32[0] = 0;  // routing_appid (not relevant for our response)
         // f32[1] already set by caller (= 1)
         f32[2] = 0;  // error_code
-        f32[3] = 1;  // eresult = OK
+        f32[3] = result.eresult;
     }
 
     LOG("[VtHook] SUCCESS: %s app=%u handled locally (response %zu bytes)",
-        methodName, realAppId, responseBody.Size());
+        methodName, realAppId, result.body.Size());
     return true;
 }
 
@@ -4110,6 +4098,11 @@ void InstallManifestPinHook() {
         g_bddOrigAddr, (void*)hookAddr);
 }
 
+void InstallReleaseStateNop() {
+    // Intentionally empty ΓÇö release-state patching removed from public builds.
+    // Kept as a stub so callers don't need to be changed.
+}
+
 void SetSendPktAddr(void* recvPktGlobalAddr) {
     if (!recvPktGlobalAddr) {
         LOG("[NS] SetSendPktAddr: recvPktGlobalAddr is null");
@@ -4184,12 +4177,13 @@ bool OnSendPkt(void* thisptr, const uint8_t* data, uint32_t size) {
             bool isNs = IsNamespaceApp(appId);
 
             if (isNs) {
-                // Namespace app Cloud RPC reached SendPkt despite vtable hooks - unexpected!
-                int count = ++g_approachDFallbackCount;
-                LOG("[SendPkt] WARNING: %s app=%u (%u bytes) escaped vtable hooks! "
-                    "Using Approach D fallback (occurrence #%d)",
-                    method.c_str(), appId, pkt.bodyLen, count);
-                // Fall through to Approach D below
+                bool isPassthroughNotif = (method == RPC_EXIT_SYNC || method == RPC_CONFLICT);
+                if (!isPassthroughNotif) {
+                    int count = ++g_approachDFallbackCount;
+                    LOG("[SendPkt] WARNING: %s app=%u (%u bytes) escaped vtable hooks! "
+                        "Using Approach D fallback (occurrence #%d)",
+                        method.c_str(), appId, pkt.bodyLen, count);
+                }
             } else {
                 if (appId != 2371090)
                     LOG("[SendPkt] %s app=%u (%u bytes) -- vtable hook active, passing through",
@@ -4281,17 +4275,15 @@ bool OnSendPkt(void* thisptr, const uint8_t* data, uint32_t size) {
     SpyLogFields("[NS-REQ]", pkt.bodyData, pkt.bodyLen);
 #endif
 
-    PB::Writer responseBody;
-
     auto dispatched = DispatchCloudRpc(method.c_str(), realAppId, innerFields);
     if (!dispatched.has_value()) {
         LOG("[NS-D] Unhandled method %s, passing through", method.c_str());
         return false;
     }
-    responseBody = std::move(*dispatched);
+    auto& result = *dispatched;
 
     // inject fabricated response via queue (old Approach D)
-    if (!InjectResponse(jobSrc, method, 1 /*eresult=success*/, responseBody)) {
+    if (!InjectResponse(jobSrc, method, result.eresult, result.body)) {
         LOG("[NS-D] Failed to inject response for %s, falling through", method.c_str());
         return false;
     }

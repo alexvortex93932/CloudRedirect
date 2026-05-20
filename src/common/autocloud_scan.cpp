@@ -603,6 +603,17 @@ ScanResult GetFileList(const std::string& steamPath,
             programData = "C:\\ProgramData\\";
         }
     }
+
+    std::string windowsHome;
+    {
+        std::string known = GetKnownFolderPathString(FOLDERID_Profile);
+        if (!known.empty()) {
+            windowsHome = known + "\\";
+        } else {
+            std::string tmp = getEnvUtf8(L"USERPROFILE");
+            if (!tmp.empty()) windowsHome = tmp + "\\";
+        }
+    }
 #else
     // Linux: map Windows known folders to XDG/home equivalents
     auto getEnvStr = [](const char* name) -> std::string {
@@ -622,6 +633,7 @@ ScanResult GetFileList(const std::string& steamPath,
     std::string myDocuments = home + "/Documents/";
     std::string savedGames = home + "/.local/share/";
     std::string programData = "/usr/share/";
+    std::string windowsHome = home + "/";
 
     // Proton: override Windows roots to compatdata prefix paths.
     std::string compatdataBase = steamPath + "/steamapps/compatdata/" + std::to_string(appId);
@@ -634,6 +646,7 @@ ScanResult GetFileList(const std::string& steamPath,
         myDocuments = pfxBase + "My Documents/";
         savedGames = pfxBase + "Saved Games/";
         programData = compatdataBase + "/pfx/drive_c/ProgramData/";
+        windowsHome = pfxBase;
     }
 #endif
 
@@ -656,6 +669,7 @@ ScanResult GetFileList(const std::string& steamPath,
     const auto& rMyDocs        = rootFor("WinMyDocuments");
     const auto& rSavedGames    = rootFor("WinSavedGames");
     const auto& rProgramData   = rootFor("WinProgramData");
+    const auto& rWindowsHome   = rootFor("WindowsHome");
 #ifndef _WIN32
     const auto& rLinuxHome     = rootFor("LinuxHome");
     const auto& rLinuxXdgData  = rootFor("LinuxXdgDataHome");
@@ -687,6 +701,7 @@ ScanResult GetFileList(const std::string& steamPath,
         {rMyDocs.bareName,      rMyDocs.token,          rMyDocs.rootId,     myDocuments},
         {rSavedGames.bareName,  rSavedGames.token,      rSavedGames.rootId, savedGames},
         {rProgramData.bareName, rProgramData.token,     rProgramData.rootId, programData},
+        {rWindowsHome.bareName, rWindowsHome.token,     rWindowsHome.rootId, windowsHome},
 #ifndef _WIN32
         {rLinuxHome.bareName,   rLinuxHome.token,       rLinuxHome.rootId,   linuxHome},
         {rLinuxXdgData.bareName, rLinuxXdgData.token,   rLinuxXdgData.rootId, linuxXdgDataHome},
@@ -1089,6 +1104,17 @@ std::unordered_map<std::string, std::string> GetRootTokenDirectories(
             programData = "C:\\ProgramData\\";
         }
     }
+
+    std::string windowsHome;
+    {
+        std::string known = GetKnownFolderPathString(FOLDERID_Profile);
+        if (!known.empty()) {
+            windowsHome = known + "\\";
+        } else {
+            std::string tmp = getEnvUtf8(L"USERPROFILE");
+            if (!tmp.empty()) windowsHome = tmp + "\\";
+        }
+    }
 #else
     auto getEnvStr = [](const char* name) -> std::string {
         const char* val = getenv(name);
@@ -1106,6 +1132,7 @@ std::unordered_map<std::string, std::string> GetRootTokenDirectories(
     std::string myDocuments = home + "/Documents/";
     std::string savedGames = home + "/.local/share/";
     std::string programData = "/usr/share/";
+    std::string windowsHome = home + "/";
 
     std::string compatdataBase = steamPath + "/steamapps/compatdata/" + std::to_string(appId);
     std::string pfxBase = compatdataBase + "/pfx/drive_c/users/steamuser/";
@@ -1116,6 +1143,7 @@ std::unordered_map<std::string, std::string> GetRootTokenDirectories(
         myDocuments = pfxBase + "My Documents/";
         savedGames = pfxBase + "Saved Games/";
         programData = compatdataBase + "/pfx/drive_c/ProgramData/";
+        windowsHome = pfxBase;
     }
 
     std::string linuxHome = home + "/";
@@ -1162,6 +1190,8 @@ std::unordered_map<std::string, std::string> GetRootTokenDirectories(
         result["%WinSavedGames%"] = savedGames;
     if (!programData.empty())
         result["%WinProgramData%"] = programData;
+    if (!windowsHome.empty())
+        result["%WindowsHome%"] = windowsHome;
 #ifndef _WIN32
     if (!linuxHome.empty())
         result["%LinuxHome%"] = linuxHome;

@@ -394,14 +394,9 @@ static void HandleConnection(int clientFd) {
             }
         }
         
-        // Require Content-Length header for uploads
-        if (!hasContentLength) {
-            LOG("[HttpServer] PUT missing Content-Length header");
-            const char* resp = "HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\n\r\n";
-            send(clientFd, resp, strlen(resp), 0);
-            close(clientFd);
-            return;
-        }
+        // Steam omits Content-Length for 0-byte files (LOCK, empty .log, etc.).
+        // Treat missing header as 0 bytes rather than rejecting.
+        // contentLength is already initialized to 0 above.
         
         uint64_t maxUpload = g_maxUploadBytes.load(std::memory_order_relaxed);
         if (contentLength > maxUpload) {

@@ -26,11 +26,6 @@ bool CloudAppState::hasActiveSession() const {
     return session.clientId != 0 && !session.operation.empty();
 }
 
-bool CloudAppState::isSessionStale(uint64_t nowUnix, uint64_t staleTimeoutSeconds) const {
-    if (!hasActiveSession()) return false;
-    if (session.timeLastUpdated == 0) return true;
-    return nowUnix > session.timeLastUpdated + staleTimeoutSeconds;
-}
 
 static std::string ShaToHex(const std::vector<uint8_t>& sha) {
     std::string hex;
@@ -77,7 +72,7 @@ std::string SerializeState(const CloudAppState& state) {
 
     if (state.hasActiveSession()) {
         Json::Value sess = Json::Object();
-        sess.objVal["client_id"] = Json::Number((double)state.session.clientId);
+        sess.objVal["client_id"] = Json::String(std::to_string(state.session.clientId));
         sess.objVal["machine"] = Json::String(state.session.machineName);
         sess.objVal["time"] = Json::Number((double)state.session.timeLastUpdated);
         sess.objVal["op"] = Json::String(state.session.operation);
@@ -138,7 +133,12 @@ bool DeserializeState(const std::string& json, CloudAppState& outState) {
 
     if (root.has("session") && root["session"].type == Json::Type::Object) {
         auto& sess = root["session"];
-        if (sess.has("client_id")) outState.session.clientId = (uint64_t)sess["client_id"].integer();
+        if (sess.has("client_id")) {
+            if (sess["client_id"].type == Json::Type::String)
+                outState.session.clientId = strtoull(sess["client_id"].str().c_str(), nullptr, 10);
+            else
+                outState.session.clientId = (uint64_t)sess["client_id"].integer();
+        }
         if (sess.has("machine")) outState.session.machineName = sess["machine"].str();
         if (sess.has("time")) outState.session.timeLastUpdated = (uint64_t)sess["time"].integer();
         if (sess.has("op")) outState.session.operation = sess["op"].str();

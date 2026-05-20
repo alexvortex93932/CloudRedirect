@@ -952,6 +952,10 @@ static void PruneStaleCloudStaging(uint32_t accountId) {
     }
 }
 
+static bool TryReadCachedBlob(const std::string& localPath,
+                              const std::string& filename,
+                              std::vector<uint8_t>& out);
+
 bool StoreBlobStaged(uint32_t accountId, uint32_t appId, uint64_t batchId,
                      const std::string& filename,
                      const uint8_t* data, size_t len) {
@@ -959,6 +963,20 @@ bool StoreBlobStaged(uint32_t accountId, uint32_t appId, uint64_t batchId,
         LOG("[CloudStorage] StoreBlob: rejecting reserved /blobs/ filename app=%u batch=%llu file=%s",
             appId, (unsigned long long)batchId, filename.c_str());
         return false;
+    }
+
+    // Skip re-write if cached blob has identical content (dedup by SHA).
+    std::string localPath = LocalBlobPath(accountId, appId, filename);
+    if (!localPath.empty()) {
+        std::vector<uint8_t> cached;
+        if (TryReadCachedBlob(localPath, filename, cached)) {
+            if (cached.size() == len &&
+                (len == 0 || std::memcmp(cached.data(), data, len) == 0)) {
+                LOG("[CloudStorage] StoreBlob: already cached with identical content, skipping write: %s (%zu bytes)",
+                    filename.c_str(), len);
+                return true;
+            }
+        }
     }
 
     // Synchronous local write via LocalStorage::WriteFileNoIncrement so it
@@ -1047,18 +1065,31 @@ std::vector<uint8_t> RetrieveBlob(uint32_t accountId, uint32_t appId,
         // Cloud download failed - check if file is missing vs network error
         auto status = g_provider->CheckExists(cloudPath);
         if (status == ICloudProvider::ExistsStatus::Missing) {
-            // File doesn't exist in cloud - check local cache as fallback
-            // (may be a file that was just uploaded locally but not yet synced)
+            // Fall back to local cache only if SHA matches manifest.
             std::vector<uint8_t> cached;
             if (TryReadCachedBlob(localPath, filename, cached)) {
-                LOG("[CloudStorage] RetrieveBlob: not in cloud, using local cache: %s (%zu bytes)",
-                    filename.c_str(), cached.size());
-                if (found) *found = true;
-                return cached;
+                Manifest manifest = LoadLocalManifest(accountId, appId);
+                auto mit = manifest.find(filename);
+                if (mit != manifest.end() && !mit->second.sha.empty()) {
+                    auto cachedSha = FileUtil::SHA1(cached.data(), cached.size());
+                    if (cachedSha == mit->second.sha) {
+                        LOG("[CloudStorage] RetrieveBlob: not in cloud, cache SHA valid: %s (%zu bytes)",
+                            filename.c_str(), cached.size());
+                        if (found) *found = true;
+                        return cached;
+                    }
+                    LOG("[CloudStorage] RetrieveBlob: not in cloud, cache SHA MISMATCH: %s (cached %zu, manifest expects different)",
+                        filename.c_str(), cached.size());
+                } else {
+                    LOG("[CloudStorage] RetrieveBlob: not in cloud, no manifest SHA, serving cached: %s (%zu bytes)",
+                        filename.c_str(), cached.size());
+                    if (found) *found = true;
+                    return cached;
+                }
             }
             LOG("[CloudStorage] RetrieveBlob: not found in cloud: %s", filename.c_str());
         } else {
-            // Network error -- only serve from local cache if SHA matches manifest.
+            // Network error: only serve from local cache if SHA matches manifest.
             std::vector<uint8_t> cached;
             if (TryReadCachedBlob(localPath, filename, cached)) {
                 Manifest manifest = LoadLocalManifest(accountId, appId);
@@ -1071,12 +1102,9 @@ std::vector<uint8_t> RetrieveBlob(uint32_t accountId, uint32_t appId,
                         if (found) *found = true;
                         return cached;
                     }
-                    LOG("[CloudStorage] RetrieveBlob: cloud error, cache SHA MISMATCH: %s -- not serving stale data",
+                    LOG("[CloudStorage] RetrieveBlob: cloud error, cache SHA MISMATCH: %s, not serving stale data",
                         filename.c_str());
                 } else {
-                    // No manifest entry for this file -- can't validate cache.
-                    // Serve it anyway; this is likely a locally-uploaded file
-                    // that hasn't been recorded in the manifest yet.
                     LOG("[CloudStorage] RetrieveBlob: cloud error, no manifest SHA for %s, serving cached (%zu bytes)",
                         filename.c_str(), cached.size());
                     if (found) *found = true;

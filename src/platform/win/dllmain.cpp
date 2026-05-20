@@ -61,6 +61,8 @@ int CloudOnSendPkt(void* thisptr, const uint8_t* data, uint32_t size, void* recv
 
             CloudIntercept::InstallManifestPinHook();
 
+            CloudIntercept::InstallReleaseStateNop();
+
             // Resolve Steam internal pointers for the app-config KV injector.
             // Used to inject quota/maxnumfiles for namespace apps where PICS
             // data is incomplete (would otherwise cause AutoCloud eviction).
