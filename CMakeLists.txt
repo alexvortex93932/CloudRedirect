@@ -228,12 +228,14 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
     target_include_directories(remotecache_repair_tests PRIVATE src/common)
     add_test(NAME remotecache_repair_tests COMMAND remotecache_repair_tests)
 
-    add_executable(bkv_stats_tests
-        tests/bkv_stats_tests.cpp
-        src/common/bkv_stats.cpp
-    )
-    target_include_directories(bkv_stats_tests PRIVATE src/common)
-    add_test(NAME bkv_stats_tests COMMAND bkv_stats_tests)
+    if(EXISTS ${CMAKE_SOURCE_DIR}/tests/bkv_stats_tests.cpp)
+        add_executable(bkv_stats_tests
+            tests/bkv_stats_tests.cpp
+            src/common/bkv_stats.cpp
+        )
+        target_include_directories(bkv_stats_tests PRIVATE src/common)
+        add_test(NAME bkv_stats_tests COMMAND bkv_stats_tests)
+    endif()
 
     add_executable(rpc_handlers_tests
         tests/rpc_handlers_tests.cpp
