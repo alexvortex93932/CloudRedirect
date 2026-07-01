@@ -672,9 +672,12 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
         static const char mask[] = "xxxxxxxxxxxx";
         uintptr_t scanAddr = SigScanner::GetTextBase();
         size_t remaining = SigScanner::GetTextSize();
-        while (remaining > 16) {
+        while (remaining >= 16) {
             uintptr_t hit = SigScanner::FindPatternInRange(scanAddr, remaining, pat, mask, 12);
             if (!hit) break;
+            // Ensure 16 bytes (12 prologue + 4 displacement) fit within scan range
+            size_t offset = hit - scanAddr;
+            if (offset + 16 > remaining) break;
             // Verify the RIP-relative target points to globalEngine
             int32_t disp = *reinterpret_cast<const int32_t*>((const uint8_t*)hit + 12);
             uintptr_t target = hit + 16 + disp;  // instruction is 16 bytes total (12 matched + 4 disp)
@@ -685,9 +688,8 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
                 break;
             }
             // Advance past this match
-            size_t consumed = (hit - scanAddr) + 16;
             scanAddr = hit + 16;
-            remaining -= consumed;
+            remaining -= (offset + 16);
         }
     }
     if (!r.flushAppMinutesPlayed)
@@ -706,7 +708,326 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     r.getSection     = ResolveGetSection();
     r.readConfigU64  = ResolveReadConfigU64(r.getAppInfo);
 
-    // Phase 10: Struct offsets (leave at 0 -- use hardcoded fallbacks for now)
+    // Phase 10: BAsyncSend (string xref — unique "CProtoBufMsg::BAsyncSend")
+    r.bAsyncSend = ResolveFuncByStringXref(
+        "CProtoBufMsg::BAsyncSend", "BAsyncSend");
+
+    // Phase 11: PlaytimeWriter — first E8 call after LEA to the handler string.
+    {
+        const char* handlerStr = "Player.ClientGetLastPlayedTimes#1";
+        size_t handlerLen = strlen(handlerStr);
+        char hmask[64];
+        memset(hmask, 'x', handlerLen);
+        hmask[handlerLen] = '\0';
+
+        uintptr_t hStrAddr = SigScanner::FindPatternInRange(
+            SigScanner::GetRdataBase(), SigScanner::GetRdataSize(),
+            (const uint8_t*)handlerStr, hmask, handlerLen);
+        if (hStrAddr) {
+            const auto* text = reinterpret_cast<const uint8_t*>(SigScanner::GetTextBase());
+            size_t textSize = SigScanner::GetTextSize();
+            __try {
+                for (size_t i = 0; i + 7 <= textSize; ++i) {
+                    if ((text[i] == 0x48 || text[i] == 0x4C) && text[i+1] == 0x8D &&
+                        (text[i+2] & 0xC7) == 0x05) {
+                        uintptr_t instrAddr = SigScanner::GetTextBase() + i;
+                        int32_t disp = *reinterpret_cast<const int32_t*>(text + i + 3);
+                        if (instrAddr + 7 + disp != hStrAddr) continue;
+
+                        // Found the LEA to the handler string. Scan forward for first E8 call.
+                        for (size_t j = i + 7; j + 5 <= textSize; ++j) {
+                            if (text[j] == 0xE8) {
+                                int32_t callDisp = *reinterpret_cast<const int32_t*>(text + j + 1);
+                                uintptr_t target = SigScanner::GetTextBase() + j + 5 + callDisp;
+                                if (target >= SigScanner::GetImageBase() &&
+                                    target < SigScanner::GetImageBase() + SigScanner::GetImageSize()) {
+                                    r.playtimeWriter = target;
+                                    LOG("[Resolver] PlaytimeWriter @ %p (RVA 0x%llX) via GetLastPlayedTimes handler call",
+                                        (void*)target, (uint64_t)(target - steamClientBase));
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        if (!r.playtimeWriter)
+            LOG("[Resolver] PlaytimeWriter: not resolved");
+    }
+
+    // Phase 12: PbMsgCtor — loads CProtoBufMsgBase vtable via RTTI, stores to [rcx],
+    // and has `mov [rcx+38h], r8d` (44 89 41 38) at +0x0A.
+    {
+        uintptr_t baseMsgVtable = SigScanner::ResolveVtableByRtti(".?AVCProtoBufMsgBase@@");
+        if (baseMsgVtable) {
+            // PbMsgCtor: sub rsp,30h then LEA rax, CProtoBufMsgBase_vt; mov [rcx], rax
+            // Unique anchor: 44 89 41 38 (mov [rcx+38h], r8d) at offset +0x0A
+            // Full prologue: 48 89 5C 24 08 57 48 83 EC 30 44 89 41 38
+            static const uint8_t pat[] = {
+                0x48, 0x89, 0x5C, 0x24, 0x08,  // mov [rsp+8], rbx
+                0x57,                           // push rdi
+                0x48, 0x83, 0xEC, 0x30,         // sub rsp, 30h
+                0x44, 0x89, 0x41, 0x38,         // mov [rcx+38h], r8d
+            };
+            static const char mask[] = "xxxxxxxxxxxxxx";
+            uintptr_t hit = SigScanner::FindPattern(pat, mask, 14);
+            if (hit) {
+                // Verify it LEAs the CProtoBufMsgBase vtable within the next 10 bytes
+                uintptr_t leaTarget = SigScanner::FindFirstRipRelLeaTarget(hit + 14, 10);
+                if (leaTarget == baseMsgVtable) {
+                    r.pbMsgCtor = hit;
+                    LOG("[Resolver] PbMsgCtor @ %p (RVA 0x%llX) via signature + vtable verify",
+                        (void*)hit, (uint64_t)(hit - steamClientBase));
+                }
+            }
+            if (!r.pbMsgCtor)
+                LOG("[Resolver] PbMsgCtor: not resolved");
+
+            // Phase 13: PbMsgCleanup — push rbx; sub rsp, 20h; lea rax, CProtoBufMsgBase_vt
+            // Pattern: 40 53 48 83 EC 20 48 8D 05 XX XX XX XX 48 8B D9
+            // where the LEA target == baseMsgVtable
+            const auto* text = reinterpret_cast<const uint8_t*>(SigScanner::GetTextBase());
+            size_t textSize = SigScanner::GetTextSize();
+            __try {
+                for (size_t i = 0; i + 16 <= textSize; ++i) {
+                    if (text[i] == 0x40 && text[i+1] == 0x53 &&
+                        text[i+2] == 0x48 && text[i+3] == 0x83 && text[i+4] == 0xEC && text[i+5] == 0x20 &&
+                        text[i+6] == 0x48 && text[i+7] == 0x8D && text[i+8] == 0x05) {
+                        int32_t disp = *reinterpret_cast<const int32_t*>(text + i + 9);
+                        uintptr_t instrAddr = SigScanner::GetTextBase() + i + 6;
+                        uintptr_t target = instrAddr + 7 + disp;
+                        if (target == baseMsgVtable) {
+                            r.pbMsgCleanup = SigScanner::GetTextBase() + i;
+                            LOG("[Resolver] PbMsgCleanup @ %p (RVA 0x%llX) via prologue + vtable LEA",
+                                (void*)r.pbMsgCleanup, (uint64_t)(r.pbMsgCleanup - steamClientBase));
+                            break;
+                        }
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            if (!r.pbMsgCleanup)
+                LOG("[Resolver] PbMsgCleanup: not resolved");
+        } else {
+            LOG("[Resolver] PbMsgCtor/Cleanup: CProtoBufMsgBase RTTI not found");
+        }
+    }
+
+    // Phase 14: PbMsgFinalize — string xref "!m_pProtoBufBody" + cmp [rcx+30h] guard.
+    {
+        const char* searchStr = "!m_pProtoBufBody";
+        size_t searchLen = strlen(searchStr);
+        char mask[128];
+        memset(mask, 'x', searchLen);
+        mask[searchLen] = '\0';
+
+        uintptr_t strAddr = SigScanner::FindPatternInRange(
+            SigScanner::GetRdataBase(), SigScanner::GetRdataSize(),
+            (const uint8_t*)searchStr, mask, searchLen);
+
+        r.pbMsgFinalize = 0;
+        if (strAddr) {
+            const auto* text = reinterpret_cast<const uint8_t*>(SigScanner::GetTextBase());
+            size_t textSize = SigScanner::GetTextSize();
+            // Check bytes: 48 83 79 30 00 = cmp qword ptr [rcx+30h], 0
+            static const uint8_t cmpPat[] = { 0x48, 0x83, 0x79, 0x30, 0x00 };
+
+            __try {
+                for (size_t i = 0; i + 7 <= textSize; ++i) {
+                    if ((text[i] == 0x48 || text[i] == 0x4C) && text[i+1] == 0x8D &&
+                        (text[i+2] & 0xC7) == 0x05) {
+                        uintptr_t instrAddr = SigScanner::GetTextBase() + i;
+                        int32_t disp = *reinterpret_cast<const int32_t*>(text + i + 3);
+                        uintptr_t refTarget = instrAddr + 7 + disp;
+                        if (refTarget != strAddr) continue;
+
+                        // Found LEA to "!m_pProtoBufBody". Walk back to function start.
+                        for (int back = 0; back < 0x80; back++) {
+                            uintptr_t candidate = instrAddr - back;
+                            if (candidate < SigScanner::GetTextBase()) break;
+                            if (!SigScanner::LooksLikeFunctionStart(candidate)) continue;
+
+                            // Verify: cmp [rcx+30h], 0 within first 13 bytes (prologue + guard)
+                            const uint8_t* fn = reinterpret_cast<const uint8_t*>(candidate);
+                            bool hasCmp = false;
+                            for (int off = 0; off <= 8; off++) {
+                                if (memcmp(fn + off, cmpPat, 5) == 0) { hasCmp = true; break; }
+                            }
+                            if (!hasCmp) break; // wrong function, try next xref
+
+                            r.pbMsgFinalize = candidate;
+                            break;
+                        }
+                        if (r.pbMsgFinalize) break;
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+
+        if (r.pbMsgFinalize)
+            LOG("[Resolver] PbMsgFinalize @ %p (RVA 0x%llX) via string xref + cmp guard",
+                (void*)r.pbMsgFinalize, (uint64_t)(r.pbMsgFinalize - steamClientBase));
+        else
+            LOG("[Resolver] PbMsgFinalize: not resolved");
+    }
+
+    // Phase 15: YieldIfTimeSlice — prologue + cmp rcx, [rip+g_pJobCur]
+    if (r.jobCurGlobal) {
+        static const uint8_t pat[] = {
+            0x48, 0x89, 0x5C, 0x24, 0x08, // mov [rsp+8], rbx
+            0x48, 0x89, 0x74, 0x24, 0x10, // mov [rsp+10h], rsi
+            0x57,                          // push rdi
+            0x48, 0x83, 0xEC, 0x20,        // sub rsp, 20h
+            0x48, 0x3B, 0x0D,              // cmp rcx, [rip+...]
+        };
+        static const char mask[] = "xxxxxxxxxxxxxxxxxx";
+        uintptr_t scanAddr = SigScanner::GetTextBase();
+        size_t remaining = SigScanner::GetTextSize();
+        while (remaining > 22) {
+            uintptr_t hit = SigScanner::FindPatternInRange(scanAddr, remaining, pat, mask, 18);
+            if (!hit) break;
+            // Verify the RIP-relative target is g_pJobCur
+            int32_t disp = *reinterpret_cast<const int32_t*>((const uint8_t*)hit + 18);
+            uintptr_t target = hit + 22 + disp;  // instr at +15 is 7 bytes (48 3B 0D xx xx xx xx)
+            if (target == r.jobCurGlobal) {
+                r.yieldIfTimeSlice = hit;
+                LOG("[Resolver] YieldIfTimeSlice @ %p (RVA 0x%llX) via prologue + g_pJobCur ref",
+                    (void*)hit, (uint64_t)(hit - steamClientBase));
+                break;
+            }
+            size_t consumed = (hit - scanAddr) + 18;
+            scanAddr = hit + 18;
+            remaining -= consumed;
+        }
+        if (!r.yieldIfTimeSlice)
+            LOG("[Resolver] YieldIfTimeSlice: not resolved");
+    } else {
+        LOG("[Resolver] YieldIfTimeSlice: skipped (jobCurGlobal not resolved)");
+    }
+
+    // Phase 16: RTTI vtables for protobuf message wrappers
+    r.getUserStatsVtable = SigScanner::ResolveVtableByRtti(
+        ".?AV?$CProtoBufMsg@VCMsgClientGetUserStats@@@@");
+    if (r.getUserStatsVtable)
+        LOG("[Resolver] GetUserStatsVtable @ %p (RVA 0x%llX) via RTTI",
+            (void*)r.getUserStatsVtable, (uint64_t)(r.getUserStatsVtable - steamClientBase));
+    else
+        LOG("[Resolver] GetUserStatsVtable: RTTI not found");
+
+    r.respWrapperVtable = SigScanner::ResolveVtableByRtti(
+        ".?AV?$CProtoBufMsg@VCPlayer_GetLastPlayedTimes_Response@@@@");
+    if (r.respWrapperVtable)
+        LOG("[Resolver] RespWrapperVtable @ %p (RVA 0x%llX) via RTTI",
+            (void*)r.respWrapperVtable, (uint64_t)(r.respWrapperVtable - steamClientBase));
+    else
+        LOG("[Resolver] RespWrapperVtable: RTTI not found");
+
+    // Phase 17: Descriptor pointers (vtable ptr in .data/.rdata).
+    {
+        // GetUserStatsDesc: find QWORD in .rdata/.data pointing to CMsgClientGetUserStats vtable
+        uintptr_t msgVtable = SigScanner::ResolveVtableByRtti(".?AVCMsgClientGetUserStats@@");
+        if (msgVtable) {
+            // Scan .data then .rdata for a QWORD containing this vtable address
+            auto scanForPtr = [&](uintptr_t sectionBase, size_t sectionSize) -> uintptr_t {
+                const auto* mem = reinterpret_cast<const uint8_t*>(sectionBase);
+                for (size_t i = 0; i + 8 <= sectionSize; i += 8) {
+                    if (*reinterpret_cast<const uintptr_t*>(mem + i) == msgVtable)
+                        return sectionBase + i;
+                }
+                return 0;
+            };
+            r.getUserStatsDesc = scanForPtr(SigScanner::GetDataBase(), SigScanner::GetDataSize());
+            if (!r.getUserStatsDesc)
+                r.getUserStatsDesc = scanForPtr(SigScanner::GetRdataBase(), SigScanner::GetRdataSize());
+            if (r.getUserStatsDesc)
+                LOG("[Resolver] GetUserStatsDesc @ %p (RVA 0x%llX) via vtable-ptr scan",
+                    (void*)r.getUserStatsDesc, (uint64_t)(r.getUserStatsDesc - steamClientBase));
+            else
+                LOG("[Resolver] GetUserStatsDesc: vtable pointer not found in .data/.rdata");
+        } else {
+            LOG("[Resolver] GetUserStatsDesc: CMsgClientGetUserStats RTTI not found");
+        }
+
+        // RespDescriptor: same for CPlayer_GetLastPlayedTimes_Response
+        uintptr_t respVtable = SigScanner::ResolveVtableByRtti(".?AVCPlayer_GetLastPlayedTimes_Response@@");
+        if (respVtable) {
+            auto scanForPtr = [&](uintptr_t sectionBase, size_t sectionSize) -> uintptr_t {
+                const auto* mem = reinterpret_cast<const uint8_t*>(sectionBase);
+                for (size_t i = 0; i + 8 <= sectionSize; i += 8) {
+                    if (*reinterpret_cast<const uintptr_t*>(mem + i) == respVtable)
+                        return sectionBase + i;
+                }
+                return 0;
+            };
+            r.respDescriptor = scanForPtr(SigScanner::GetDataBase(), SigScanner::GetDataSize());
+            if (!r.respDescriptor)
+                r.respDescriptor = scanForPtr(SigScanner::GetRdataBase(), SigScanner::GetRdataSize());
+            if (r.respDescriptor)
+                LOG("[Resolver] RespDescriptor @ %p (RVA 0x%llX) via vtable-ptr scan",
+                    (void*)r.respDescriptor, (uint64_t)(r.respDescriptor - steamClientBase));
+            else
+                LOG("[Resolver] RespDescriptor: vtable pointer not found in .data/.rdata");
+        } else {
+            LOG("[Resolver] RespDescriptor: CPlayer_GetLastPlayedTimes_Response RTTI not found");
+        }
+    }
+
+    // Phase 18: RegKeySyncTime — string ptr scan, synthetic slot fallback.
+    {
+        const char needle[] = "LastPlayedTimesSyncTime";
+        size_t needleLen = sizeof(needle) - 1;
+        char nmask[32];
+        memset(nmask, 'x', needleLen);
+        nmask[needleLen] = '\0';
+
+        uintptr_t strAddr = SigScanner::FindPatternInRange(
+            SigScanner::GetRdataBase(), SigScanner::GetRdataSize(),
+            (const uint8_t*)needle, nmask, needleLen);
+        if (!strAddr) strAddr = SigScanner::FindPatternInRange(
+            SigScanner::GetDataBase(), SigScanner::GetDataSize(),
+            (const uint8_t*)needle, nmask, needleLen);
+        if (strAddr) {
+            // The needle may match inside a longer string (e.g.
+            // "Software\Valve\Steam\LastPlayedTimesSyncTime"). Walk backward to
+            // the containing C-string's start for the pointer search.
+            {
+                const uint8_t* p = reinterpret_cast<const uint8_t*>(strAddr);
+                const uint8_t* modBase = reinterpret_cast<const uint8_t*>(steamClientBase);
+                while (p > modBase && *(p - 1) != 0) { p--; strAddr--; }
+                LOG("[Resolver] RegKeySyncTime: needle in containing string at RVA 0x%llX: \"%.80s\"",
+                    (uint64_t)(strAddr - steamClientBase), (const char*)strAddr);
+            }
+            // Find the QWORD pointer to this string in .data/.rdata
+            auto scanForPtr = [&](uintptr_t sectionBase, size_t sectionSize) -> uintptr_t {
+                const auto* mem = reinterpret_cast<const uint8_t*>(sectionBase);
+                for (size_t i = 0; i + 8 <= sectionSize; i += 8) {
+                    if (*reinterpret_cast<const uintptr_t*>(mem + i) == strAddr)
+                        return sectionBase + i;
+                }
+                return 0;
+            };
+            r.regKeySyncTime = scanForPtr(SigScanner::GetDataBase(), SigScanner::GetDataSize());
+            if (!r.regKeySyncTime)
+                r.regKeySyncTime = scanForPtr(SigScanner::GetRdataBase(), SigScanner::GetRdataSize());
+            if (r.regKeySyncTime) {
+                LOG("[Resolver] RegKeySyncTime @ %p (RVA 0x%llX) via string-ptr scan",
+                    (void*)r.regKeySyncTime, (uint64_t)(r.regKeySyncTime - steamClientBase));
+            } else {
+                // Newer builds: no absolute pointer in data sections (LEA-referenced).
+                // Synthesize a stable slot that dereferences to the string address.
+                static uintptr_t s_syntheticSlot = 0;
+                s_syntheticSlot = strAddr;
+                r.regKeySyncTime = (uintptr_t)&s_syntheticSlot;
+                LOG("[Resolver] RegKeySyncTime @ %p (synthetic, string at RVA 0x%llX)",
+                    (void*)r.regKeySyncTime, (uint64_t)(strAddr - steamClientBase));
+            }
+        } else {
+            LOG("[Resolver] RegKeySyncTime: 'LastPlayedTimesSyncTime' string not found");
+        }
+    }
+
+    // Phase 19: Struct offsets (leave at 0 -- use hardcoded fallbacks for now)
     r.engineOffJobMgr       = 0;
     r.engineOffGlobalHandle = 0;
     r.engineOffUserMap      = 0;
@@ -761,6 +1082,17 @@ void LogComparison(const ResolvedAddrs& r, uintptr_t base) {
     logEntry("GetAppInfo",             r.getAppInfo,              0x4A2370);
     logEntry("GetSection",             r.getSection,              0x4A46A0);
     logEntry("ReadConfigU64",          r.readConfigU64,           0x4A33E0);
+    logEntry("BAsyncSend",             r.bAsyncSend,              0xCF9590);
+    logEntry("PlaytimeWriter",         r.playtimeWriter,          0x9CC050);
+    logEntry("PbMsgCtor",              r.pbMsgCtor,               0xCF8F90);
+    logEntry("PbMsgFinalize",          r.pbMsgFinalize,           0xCFBB30);
+    logEntry("PbMsgCleanup",           r.pbMsgCleanup,            0xCF9240);
+    logEntry("YieldIfTimeSlice",       r.yieldIfTimeSlice,        0xCEF280);
+    logEntry("GetUserStatsVtable",     r.getUserStatsVtable,      0x1341318);
+    logEntry("GetUserStatsDesc",       r.getUserStatsDesc,        0x16F1670);
+    logEntry("RespWrapperVtable",      r.respWrapperVtable,       0x132DD40);
+    logEntry("RespDescriptor",         r.respDescriptor,          0x16CE4D8);
+    logEntry("RegKeySyncTime",         r.regKeySyncTime,          0x16E10C8);
 
     LOG("[Resolver] Result: %d/%d matched, %d failed", matched, total, failed);
 }

@@ -8,23 +8,6 @@
 
 namespace SteamKvInjector {
 
-#ifdef _WIN32
-// Auto-resolved addresses. Fields left at 0 fall back to hardcoded RVAs.
-struct Overrides {
-    uintptr_t globalEngine  = 0;
-    uintptr_t getAppInfo    = 0;
-    uintptr_t getSection    = 0;
-    uintptr_t readConfigU64 = 0;
-    uintptr_t kvFindKey     = 0;
-    uintptr_t kvGetUint64   = 0;
-    uintptr_t kvGetInt      = 0;
-    uintptr_t kvSetUint64   = 0;
-    uintptr_t kvSetInt      = 0;
-    uintptr_t kvSetString   = 0;
-};
-void SetOverrides(const Overrides& ov);
-#endif
-
 bool Init();
 
 bool IsReady();
@@ -32,14 +15,11 @@ bool IsReady();
 // Read current ufs.quota/maxnumfiles from KV. False if injector not ready.
 bool ReadAppQuota(uint32_t appId, uint64_t& outQuotaBytes, uint32_t& outMaxNumFiles);
 
-// Trigger PICS fetch and poll for results. False on timeout.
-bool TriggerPicsAndWait(uint32_t appId,
-                        uint64_t& outQuotaBytes,
-                        uint32_t& outMaxNumFiles,
-                        int timeoutMs = 500);
-
 // Write quota/maxnumfiles into KV. Won't clobber existing non-zero values.
 bool InjectAppQuota(uint32_t appId, uint64_t quotaBytes, uint32_t maxNumFiles);
+
+// Raise live ufs maxnumfiles/quota to at least the given floor. Idempotent.
+bool EnsureMaxNumFilesFloor(uint32_t appId, uint32_t floorFiles, uint64_t floorBytes);
 
 // A single AutoCloud save-file rule for KV injection.
 struct SaveFileRule {
@@ -52,5 +32,10 @@ struct SaveFileRule {
 
 // Inject savefiles rules into UFS KV. Won't clobber existing children.
 bool InjectSaveFiles(uint32_t appId, const std::vector<SaveFileRule>& rules);
+
+// Dynamically-resolved engine global pointer (Linux only). Returns the address
+// of the pointer variable (void**) so callers can dereference it at call time.
+// Null if Init hasn't resolved it yet.
+void** GetEngineGlobalPtr();
 
 } // namespace SteamKvInjector

@@ -1,0 +1,107 @@
+<Page x:Class="CloudRedirect.Pages.NewsPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+      xmlns:res="clr-namespace:CloudRedirect.Resources"
+      ScrollViewer.CanContentScroll="False">
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="24">
+        <StackPanel MaxWidth="800">
+
+            <Border x:Name="UpdateBanner"
+                    Visibility="Collapsed"
+                    Background="#332F7A2F"
+                    BorderBrush="#FF6A9F42"
+                    BorderThickness="1"
+                    CornerRadius="8"
+                    Padding="16"
+                    Margin="0,0,0,16">
+                <DockPanel>
+                    <ui:Button Content="{res:Loc Dashboard_UpdateNow}"
+                               Appearance="Success"
+                               DockPanel.Dock="Right"
+                               VerticalAlignment="Center"
+                               Click="UpdateDll_Click" />
+                    <StackPanel VerticalAlignment="Center" Margin="0,0,12,0">
+                        <TextBlock Text="{res:Loc Dashboard_UpdateAvailable}"
+                                   FontWeight="SemiBold" FontSize="14"
+                                   Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                        <TextBlock Text="{res:Loc Dashboard_UpdateAvailableDescription}"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                </DockPanel>
+            </Border>
+
+            <TextBlock Text="What's new?"
+                       FontSize="28" FontWeight="SemiBold"
+                       Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                       Margin="0,0,0,24" />
+
+            <!-- Achievement and playtime sync -->
+            <ui:CardControl Margin="0,0,0,12">
+                <ui:CardControl.Header>
+                    <StackPanel>
+                        <TextBlock Text="Achievement and Playtime Sync" FontWeight="SemiBold"
+                                   Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                        <TextBlock Text="Achievements and Playtime can now be synced to the cloud! Cross-device play is supported. Works through the normal Steam systems. Enable in Settings if you are interested. Note that this feature is experimental!"
+                                   TextWrapping="Wrap"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                </ui:CardControl.Header>
+            </ui:CardControl>
+
+            <!-- Achievement schema fetching -->
+            <ui:CardControl Margin="0,0,0,12">
+                <ui:CardControl.Header>
+                    <StackPanel>
+                        <TextBlock Text="Achievement Schema Fetching for SteamTools" FontWeight="SemiBold"
+                                   Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                        <TextBlock Text="CR can now fetch achievement schemas, so games that previously did not display achievements will now display them!"
+                                   TextWrapping="Wrap"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                </ui:CardControl.Header>
+            </ui:CardControl>
+
+            <!-- Show Lua game in status -->
+            <ui:CardControl Margin="0,0,0,12">
+                <ui:CardControl.Header>
+                    <StackPanel>
+                        <TextBlock Text="Show Lua Game in Status" FontWeight="SemiBold"
+                                   Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                        <TextBlock Text="Lua apps can now appear in your Steam status. They appear as a non-Steam game with the correct game name. This change is on by default, disable in Settings if you don't want it."
+                                   TextWrapping="Wrap"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                </ui:CardControl.Header>
+            </ui:CardControl>
+
+            <!-- 760 Clean Up -->
+            <ui:CardControl Margin="0,0,0,12">
+                <ui:CardControl.Header>
+                    <StackPanel>
+                        <TextBlock Text="760 Clean Up" FontWeight="SemiBold"
+                                   Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                        <TextBlock Text="There is a new (experimental) tool that can delete the saves that SteamTools uploaded to AppID 760. Read the release notes on Github for more information."
+                                   TextWrapping="Wrap"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                </ui:CardControl.Header>
+            </ui:CardControl>
+
+            <!-- And more -->
+            <ui:CardControl Margin="0,0,0,12">
+                <ui:CardControl.Header>
+                    <StackPanel>
+                        <TextBlock Text="...and more!" FontWeight="SemiBold"
+                                   Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                        <TextBlock Text="Bug fixes, performance improvements, and under-the-hood changes to keep your cloud saves safe and fast."
+                                   TextWrapping="Wrap"
+                                   Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                </ui:CardControl.Header>
+            </ui:CardControl>
+
+        </StackPanel>
+    </ScrollViewer>
+</Page>

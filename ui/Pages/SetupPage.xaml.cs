@@ -15,6 +15,9 @@ namespace CloudRedirect.Pages;
 public partial class SetupPage : Page
 {
     private string? _steamPath;
+    private string? _mode;
+    /// <summary>"steamtools" or "thirdparty"; null until user picks one.</summary>
+    private string? _clientType;
     private readonly StringBuilder _logBuffer = new();
     private readonly object _logLock = new();
     private bool _isRunning;
@@ -25,6 +28,7 @@ public partial class SetupPage : Page
     public SetupPage()
     {
         InitializeComponent();
+        RadioThirdParty.Content = S.Get("Setup_ClientType_ThirdParty");
 
         Loaded += async (_, _) =>
         {
@@ -32,13 +36,55 @@ public partial class SetupPage : Page
             {
                 _steamPath = await Task.Run(() => SteamDetector.FindSteamPath());
 
-                var mode = SteamDetector.ReadModeSetting();
-                if (mode == "stfixer")
+                _mode = SteamDetector.ReadModeSetting();
+                if (_mode == "stfixer")
                 {
                     DescriptionText.Text = S.Get("Setup_Description_STFixer");
                     CloudRedirectPatchHeaderText.Text = S.Get("Setup_CloudRedirectPatchHeader_STFixer");
                     CloudRedirectPatchDescriptionText.Text = S.Get("Setup_CloudRedirectPatchDescription_STFixer");
+                    // STFixer mode doesn't need client type choice — always SteamTools.
+                    _clientType = "steamtools";
+                    ClientTypeSelector.Visibility = Visibility.Collapsed;
+                    RunAllButton.IsEnabled = true;
                 }
+                else
+                {
+                    // Restore saved client_type or auto-detect from patched install.
+                    var (saved, detected) = await Task.Run(() =>
+                    {
+                        var s = ReadClientTypeSetting();
+                        string? d = null;
+                        if (s == null && _steamPath != null)
+                        {
+                            try
+                            {
+                                var patcher = new Patcher(_steamPath, _ => { });
+                                if (patcher.HasCoreDll() &&
+                                    patcher.GetPatchState() == PatchState.Patched)
+                                    d = "steamtools";
+                            }
+                            catch { }
+                        }
+                        return (s, d);
+                    });
+
+                    var preselect = saved ?? detected;
+                    if (preselect != null)
+                    {
+                        _clientType = preselect;
+                        ApplyClientTypeSelection(preselect);
+                    }
+                    else
+                    {
+                        _clientType = null;
+                        RunAllButton.IsEnabled = false;
+                    }
+                }
+
+                // Load saved manifest endpoint override.
+                var (ep, ua) = ReadManifestEndpointSetting();
+                if (!string.IsNullOrEmpty(ep)) ManifestEndpointBox.Text = ep;
+                if (!string.IsNullOrEmpty(ua)) ManifestUserAgentBox.Text = ua;
 
                 await RefreshStatuses();
             }
@@ -59,6 +105,136 @@ public partial class SetupPage : Page
         DiagnosticsPanel.Visibility = DiagnosticsToggle.IsChecked == true
             ? Visibility.Visible
             : Visibility.Collapsed;
+    }
+
+    private void RadioSteamTools_Checked(object sender, RoutedEventArgs e)
+    {
+        _clientType = "steamtools";
+        ApplyClientTypeSelection("steamtools");
+        SaveClientTypeSetting("steamtools");
+        ClientTypeWarning.Visibility = Visibility.Collapsed;
+        (Window.GetWindow(this) as MainWindow)?.ApplyMode(_mode, "steamtools");
+    }
+
+    private async void RadioThirdParty_Checked(object sender, RoutedEventArgs e)
+    {
+        _clientType = "thirdparty";
+        ApplyClientTypeSelection("thirdparty");
+        SaveClientTypeSetting("thirdparty");
+        (Window.GetWindow(this) as MainWindow)?.ApplyMode(_mode, "thirdparty");
+
+        // Probe for a compatible client DLL; warn if none found.
+        if (_steamPath != null)
+        {
+            var result = await Task.Run(() => ThirdPartyDetector.Detect(_steamPath));
+            if (!result.ClientDetected)
+            {
+                ClientTypeWarning.Text = S.Get("Setup_ClientType_NoClientWarning");
+                ClientTypeWarning.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                ClientTypeWarning.Visibility = Visibility.Collapsed;
+            }
+        }
+    }
+
+    private void ApplyClientTypeSelection(string clientType)
+    {
+        RadioSteamTools.IsChecked = clientType == "steamtools";
+        RadioThirdParty.IsChecked = clientType == "thirdparty";
+
+        if (clientType == "thirdparty")
+        {
+            RunAllButton.Content = S.Get("Setup_DeployDll");
+            STOnlySection.Visibility = Visibility.Collapsed;
+            ManifestEndpointSection.Visibility = Visibility.Collapsed;
+        }
+        else
+        {
+            RunAllButton.Content = S.Get("Setup_RunAllPatches");
+            STOnlySection.Visibility = Visibility.Visible;
+            ManifestEndpointSection.Visibility = Visibility.Visible;
+        }
+
+        RunAllButton.IsEnabled = !_isRunning;
+    }
+
+    private static string? ReadClientTypeSetting()
+    {
+        try
+        {
+            var path = System.IO.Path.Combine(SteamDetector.GetConfigDir(), "settings.json");
+            if (!File.Exists(path)) return null;
+            var json = File.ReadAllText(path);
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("client_type", out var ct) &&
+                ct.ValueKind == JsonValueKind.String)
+                return ct.GetString();
+        }
+        catch { }
+        return null;
+    }
+
+    private static void SaveClientTypeSetting(string clientType)
+    {
+        try
+        {
+            var path = System.IO.Path.Combine(SteamDetector.GetConfigDir(), "settings.json");
+            var dir = System.IO.Path.GetDirectoryName(path)!;
+            if (!System.IO.Directory.Exists(dir))
+                System.IO.Directory.CreateDirectory(dir);
+            ConfigHelper.SaveConfig(path, new[] { "client_type" }, writer =>
+            {
+                writer.WriteString("client_type", clientType);
+            });
+        }
+        catch { }
+    }
+
+    private static (string? endpoint, string? userAgent) ReadManifestEndpointSetting()
+    {
+        try
+        {
+            var path = System.IO.Path.Combine(SteamDetector.GetConfigDir(), "settings.json");
+            if (!File.Exists(path)) return (null, null);
+            var json = File.ReadAllText(path);
+            using var doc = JsonDocument.Parse(json);
+            string? ep = null, ua = null;
+            if (doc.RootElement.TryGetProperty("manifest_endpoint", out var epVal) &&
+                epVal.ValueKind == JsonValueKind.String)
+                ep = epVal.GetString();
+            if (doc.RootElement.TryGetProperty("manifest_user_agent", out var uaVal) &&
+                uaVal.ValueKind == JsonValueKind.String)
+                ua = uaVal.GetString();
+            return (ep, ua);
+        }
+        catch { }
+        return (null, null);
+    }
+
+    private static void SaveManifestEndpointSetting(string? endpoint, string? userAgent)
+    {
+        try
+        {
+            var path = System.IO.Path.Combine(SteamDetector.GetConfigDir(), "settings.json");
+            ConfigHelper.SaveConfig(path,
+                new[] { "manifest_endpoint", "manifest_user_agent" }, writer =>
+            {
+                if (!string.IsNullOrWhiteSpace(endpoint))
+                    writer.WriteString("manifest_endpoint", endpoint.Trim());
+                if (!string.IsNullOrWhiteSpace(userAgent))
+                    writer.WriteString("manifest_user_agent", userAgent.Trim());
+            });
+        }
+        catch { }
+    }
+
+    private void ManifestEndpoint_LostFocus(object sender, RoutedEventArgs e)
+    {
+        SaveManifestEndpointSetting(
+            ManifestEndpointBox.Text,
+            ManifestUserAgentBox.Text);
     }
 
     private async void BrowseSteamDir_Click(object sender, RoutedEventArgs e)
@@ -143,7 +319,7 @@ public partial class SetupPage : Page
 
         if (!running) return;
 
-        Log("Steam is running -- shutting it down...");
+        Log("Steam is running - shutting it down...");
 
         await Task.Run(() =>
         {
@@ -220,7 +396,6 @@ public partial class SetupPage : Page
         return found;
     }
 
-    // Computed off-thread by ComputeStatusSnapshot, applied by ApplyStatusSnapshot.
     private sealed record StatusSnapshot(
         long? Version,
         PatchState OfflineState,
@@ -234,7 +409,7 @@ public partial class SetupPage : Page
         bool? DllIsCurrent,
         bool EmbeddedAvailable);
 
-    private static StatusSnapshot ComputeStatusSnapshot(string steamPath)
+    private static StatusSnapshot ComputeStatusSnapshot(string steamPath, bool skipPatcher = false)
     {
         var version = SteamDetector.GetSteamVersion(steamPath);
         var offline = PatchState.NotInstalled;
@@ -243,18 +418,21 @@ public partial class SetupPage : Page
         var probeFailed = false;
         string? probeError = null;
 
-        try
+        if (!skipPatcher)
         {
-            // One Patcher instance so the AES-decrypted payload cache is reused.
-            var patcher = new Patcher(steamPath, _ => { });
-            offline = patcher.GetOfflinePatchState();
-            stExe = patcher.GetSteamToolsExePatchState();
-            patchState = patcher.GetPatchState();
-        }
-        catch (Exception ex)
-        {
-            probeFailed = true;
-            probeError = ex.Message;
+            try
+            {
+                // One Patcher instance so the AES-decrypted payload cache is reused.
+                var patcher = new Patcher(steamPath, _ => { });
+                offline = patcher.GetOfflinePatchState();
+                stExe = patcher.GetSteamToolsExePatchState();
+                patchState = patcher.GetPatchState();
+            }
+            catch (Exception ex)
+            {
+                probeFailed = true;
+                probeError = ex.Message;
+            }
         }
 
         var dllExists = false;
@@ -303,9 +481,12 @@ public partial class SetupPage : Page
         SteamPathText.Text = _steamPath ?? S.Get("Setup_SteamNotFoundManual");
         if (_steamPath == null)
         {
-            OfflineStatusText.Text = S.Get("Setup_SteamNotFound");
-            StExeStatusText.Text = S.Get("Setup_SteamNotFound");
-            PatchStatusText.Text = S.Get("Setup_SteamNotFound");
+            if (_clientType != "thirdparty")
+            {
+                OfflineStatusText.Text = S.Get("Setup_SteamNotFound");
+                StExeStatusText.Text = S.Get("Setup_SteamNotFound");
+                PatchStatusText.Text = S.Get("Setup_SteamNotFound");
+            }
             DeployStatusText.Text = S.Get("Setup_SteamNotFound");
             VersionStatusText.Text = S.Get("Setup_VersionCouldNotDetermine");
             VersionIcon.Symbol = Wpf.Ui.Controls.SymbolRegular.Warning24;
@@ -314,18 +495,22 @@ public partial class SetupPage : Page
 
         // Capture path so a racing path-flip can't apply a stale result.
         var capturedPath = _steamPath;
+        var skipPatcher = _clientType == "thirdparty";
         StatusSnapshot snap;
         try
         {
-            snap = await Task.Run(() => ComputeStatusSnapshot(capturedPath));
+            snap = await Task.Run(() => ComputeStatusSnapshot(capturedPath, skipPatcher));
         }
         catch (Exception ex)
         {
             // Unexpected (snapshot already swallows the expected ones).
             if (gen != _refreshGeneration) return;
-            OfflineStatusText.Text = S.Format("Setup_CouldNotCheck", ex.Message);
-            StExeStatusText.Text = S.Format("Setup_CouldNotCheck", ex.Message);
-            PatchStatusText.Text = S.Format("Setup_CouldNotCheck", ex.Message);
+            if (!skipPatcher)
+            {
+                OfflineStatusText.Text = S.Format("Setup_CouldNotCheck", ex.Message);
+                StExeStatusText.Text = S.Format("Setup_CouldNotCheck", ex.Message);
+                PatchStatusText.Text = S.Format("Setup_CouldNotCheck", ex.Message);
+            }
             return;
         }
 
@@ -340,13 +525,16 @@ public partial class SetupPage : Page
         catch (Exception ex)
         {
             // S.Format / brush / control writes can throw on a navigated-away page.
-            try
+            if (!skipPatcher)
             {
-                OfflineStatusText.Text = S.Format("Setup_CouldNotCheck", ex.Message);
-                StExeStatusText.Text = S.Format("Setup_CouldNotCheck", ex.Message);
-                PatchStatusText.Text = S.Format("Setup_CouldNotCheck", ex.Message);
+                try
+                {
+                    OfflineStatusText.Text = S.Format("Setup_CouldNotCheck", ex.Message);
+                    StExeStatusText.Text = S.Format("Setup_CouldNotCheck", ex.Message);
+                    PatchStatusText.Text = S.Format("Setup_CouldNotCheck", ex.Message);
+                }
+                catch { }
             }
-            catch { }
         }
     }
 
@@ -469,7 +657,6 @@ public partial class SetupPage : Page
             : Visibility.Collapsed;
     }
 
-    // Per-button post-action refreshers; off-thread to avoid stalling the UI.
     private async Task RefreshPatchStatusAsync()
     {
         var gen = System.Threading.Interlocked.Increment(ref _refreshGeneration);
@@ -552,7 +739,7 @@ public partial class SetupPage : Page
                     writer.WriteString("sync_path", localCloudPath);
                 }));
 
-            Log($"Default config written -- saves will sync to: {localCloudPath}");
+            Log($"Default config written - saves will sync to: {localCloudPath}");
             Log("You can change this later on the Cloud Provider page.");
         }
         catch (Exception ex)
@@ -563,7 +750,13 @@ public partial class SetupPage : Page
 
     private async void RunAll_Click(object sender, RoutedEventArgs e)
     {
-        if (_isRunning || _steamPath == null) return;
+        if (_isRunning || _steamPath == null || _clientType == null) return;
+
+        if (_clientType == "thirdparty")
+        {
+            await RunAllThirdParty();
+            return;
+        }
 
         var confirm = await Services.Dialog.ConfirmAsync(S.Get("Setup_RunAllPatches"),
             S.Get("Setup_ConfirmRunAll"));
@@ -671,7 +864,7 @@ public partial class SetupPage : Page
                 Log("OK");
             else
             {
-                Log("FAILED -- see detail above");
+                Log("FAILED - see detail above");
                 allSucceeded = false;
             }
         }
@@ -749,7 +942,7 @@ public partial class SetupPage : Page
 
         if (!allSucceeded)
         {
-            Log("Some steps failed -- review the log above.");
+            Log("Some steps failed - review the log above.");
         }
         else
         {
@@ -798,6 +991,103 @@ public partial class SetupPage : Page
 
         if (needsAutoUpdatePrompt)
             await PromptAutoUpdateAsync();
+
+        SetBusy(false);
+    }
+
+    /// <summary>
+    /// Third-party mode: only deploy cloud_redirect.dll + prompt for provider/auto-update.
+    /// </summary>
+    private async Task RunAllThirdParty()
+    {
+        if (!EmbeddedDll.IsAvailable())
+        {
+            await Services.Dialog.ShowWarningAsync(S.Get("Setup_DllNotEmbedded"),
+                S.Get("Setup_DllNotEmbeddedMessage"));
+            return;
+        }
+
+        var confirm = await Services.Dialog.ConfirmAsync(S.Get("Setup_DeployDllTitle"),
+            S.Get("Setup_ConfirmDeployThirdParty"));
+
+        if (!confirm) return;
+
+        SetBusy(true);
+        ClearLog();
+
+        await EnsureSteamClosed();
+
+        Log("═══ Deploy cloud_redirect.dll ═══");
+
+        bool succeeded = false;
+        try
+        {
+            var destPath = Path.Combine(_steamPath!, "cloud_redirect.dll");
+            var deployError = await Task.Run(() => EmbeddedDll.DeployTo(destPath));
+
+            if (deployError != null)
+            {
+                Log($"FAILED: {deployError}");
+                DeployStatusText.Text = S.Get("Setup_DeployFailed");
+            }
+            else
+            {
+                var info = new FileInfo(destPath);
+                DeployStatusText.Text = S.Format("Setup_DllInstalled", info.Length.ToString("N0"), info.LastWriteTime.ToString("g"));
+                Log($"Deployed to {destPath}");
+                Log("OK");
+                succeeded = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"FAILED: {ex.Message}");
+            DeployStatusText.Text = S.Get("Setup_DeployFailed");
+        }
+
+        Log("");
+
+        if (succeeded)
+        {
+            Log("DLL deployed. Your third-party client will load it on next Steam launch.");
+
+            bool providerReady = false;
+            var existingConfig = Services.SteamDetector.ReadConfig();
+            if (existingConfig != null &&
+                existingConfig.Provider is "gdrive" or "onedrive" &&
+                !string.IsNullOrEmpty(existingConfig.TokenPath))
+            {
+                var tokenStatus = Services.OAuthService.CheckTokenStatus(existingConfig.TokenPath);
+                providerReady = tokenStatus.IsAuthenticated;
+            }
+
+            if (!providerReady)
+            {
+                var statusText = S.Get("Setup_AllPatchesApplied");
+                string message = existingConfig != null
+                    ? S.Format("Setup_ConfigureProviderExisting", statusText, existingConfig.DisplayName)
+                    : S.Format("Setup_ConfigureProviderNew", statusText);
+
+                var wantsConfigure = await Services.Dialog.ChoiceAsync(
+                    S.Get("Setup_ConfigureProviderTitle"),
+                    message,
+                    S.Get("Setup_ConfigureProvider"),
+                    S.Get("Setup_UseLocalStorage"));
+
+                if (wantsConfigure)
+                {
+                    var nav = FindNavigationView();
+                    nav?.Navigate(typeof(CloudProviderPage));
+                }
+                else if (existingConfig == null)
+                {
+                    await WriteDefaultLocalConfig();
+                }
+            }
+
+            if (!HasBeenPromptedForAutoUpdate())
+                await PromptAutoUpdateAsync();
+        }
 
         SetBusy(false);
     }
@@ -965,8 +1255,8 @@ public partial class SetupPage : Page
             await RefreshStExeStatusAsync();
             Log("");
             Log(stResult == 1 ? "SteamTools.exe patched."
-              : stResult == 0 ? "SteamTools.exe not found -- nothing to patch."
-              : "Patch failed -- see log above.");
+              : stResult == 0 ? "SteamTools.exe not found - nothing to patch."
+              : "Patch failed - see log above.");
         }
         catch (Exception ex)
         {
@@ -1006,7 +1296,7 @@ public partial class SetupPage : Page
 
             await RefreshStExeStatusAsync();
             Log("");
-            Log(success ? "SteamTools.exe restored." : "Restore failed -- see log above.");
+            Log(success ? "SteamTools.exe restored." : "Restore failed - see log above.");
         }
         catch (Exception ex)
         {

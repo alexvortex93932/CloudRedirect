@@ -378,6 +378,8 @@ namespace CloudRedirect.Services.Patching
             if (resolved == null)
                 return PatchState.UnknownVersion;
 
+            resolved = AppendManifestEndpointPatches(payload, resolved);
+
             var (_, applied, skipped, errors) = CheckPatches(payload, resolved);
 
             if (errors.Count > 0)
@@ -440,22 +442,32 @@ namespace CloudRedirect.Services.Patching
                     return result.Fail(plErr);
 
                 var resolvedSetup = ResolveSetupPatchOffsets(payload);
-
-                // Payload may be corrupted by a prior CR version; try the embedded copy.
                 if (resolvedSetup == null || resolvedSetup.Length == 0)
                 {
-                    var (recPath, recPayload, recIv) = TryRecoverCorruptedPayload(cachePath);
-                    if (recPath != null)
+                    // Cached payload is unsupported — try deploying the embedded one.
+                    Log("  Cached payload unsupported, deploying embedded payload..");
+                    var embeddedPath = DeployEmbeddedPayload();
+                    if (embeddedPath != null)
                     {
-                        cachePath = recPath;
-                        payload = recPayload;
-                        iv = recIv;
-                        resolvedSetup = ResolveSetupPatchOffsets(payload);
+                        cachePath = embeddedPath;
+                        var (payload2, iv2, plErr2) = ReadAndDecryptPayload(cachePath);
+                        if (payload2 != null)
+                        {
+                            var resolvedRetry = ResolveSetupPatchOffsets(payload2);
+                            if (resolvedRetry != null && resolvedRetry.Length > 0)
+                            {
+                                payload = payload2;
+                                iv = iv2;
+                                resolvedSetup = resolvedRetry;
+                            }
+                        }
                     }
+                    if (resolvedSetup == null || resolvedSetup.Length == 0)
+                        return result.Fail("Could not identify activation patch locations in payload - unsupported version?");
                 }
 
-                if (resolvedSetup == null || resolvedSetup.Length == 0)
-                    return result.Fail("Could not identify activation patch locations in payload - unsupported version?");
+                // Append manifest endpoint patches if configured.
+                resolvedSetup = AppendManifestEndpointPatches(payload, resolvedSetup);
 
                 var (patchedPayload, plApplied, plSkipped, plErrors) = ApplyPatches(payload, resolvedSetup);
                 if (plErrors.Count > 0)
@@ -510,15 +522,19 @@ namespace CloudRedirect.Services.Patching
 
             var version = SteamDetector.GetSteamVersion(_steamPath);
             if (version == null)
+            {
                 Log("  WARNING: Could not read Steam version from manifest");
+            }
             else
+            {
                 Log($"  Steam version: {version.Value}");
+            }
 
             try
             {
                 var hijackDll = FindCoreDll();
                 if (hijackDll == null)
-                    return result.Fail("SteamTools Core DLL not found.");
+                    return result.Fail("SteamTools Core DLL not found. Is SteamTools installed?");
 
                 var dllPath = Path.Combine(_steamPath, hijackDll);
                 byte[] dllData;
@@ -547,6 +563,8 @@ namespace CloudRedirect.Services.Patching
                 var resolvedSetup = ResolveSetupPatchOffsets(payload);
                 if (resolvedSetup == null)
                     return result.Fail("Could not identify patch locations in payload");
+
+                resolvedSetup = AppendManifestEndpointPatches(payload, resolvedSetup);
 
                 var (revertedPayload, plReverted, plSkipped, plErrors) = UnapplyPatches(payload, resolvedSetup);
                 if (plErrors.Count > 0)
@@ -777,54 +795,6 @@ namespace CloudRedirect.Services.Patching
             {
                 Log($"  Deploy failed: {ex.Message}");
                 return null;
-            }
-        }
-
-        // Sideline a corrupted cache file, deploy the embedded payload, and re-decrypt.
-        (string cachePath, byte[] payload, byte[] iv) TryRecoverCorruptedPayload(string oldCachePath)
-        {
-            try
-            {
-                var corruptPath = oldCachePath + ".corrupt";
-                Log("  Payload appears corrupted by a previous version. Attempting recovery...");
-
-                // Sideline the corrupted file (overwrite any prior .corrupt).
-                try
-                {
-                    File.Move(oldCachePath, corruptPath, overwrite: true);
-                    Log($"  Corrupted payload saved to {Path.GetFileName(corruptPath)}");
-                }
-                catch (Exception ex)
-                {
-                    Log($"  Could not rename corrupted payload: {ex.Message}");
-                    return (null, null, null);
-                }
-
-                // Deploy the embedded (clean) payload.
-                var newPath = DeployEmbeddedPayload();
-                if (newPath == null)
-                {
-                    Log("  Recovery failed: no embedded payload available for this Steam build.");
-                    // Restore the original so the user isn't left with nothing.
-                    try { File.Move(corruptPath, oldCachePath, overwrite: true); } catch { }
-                    return (null, null, null);
-                }
-
-                // Read and decrypt the fresh payload.
-                var (payload, iv, err) = ReadAndDecryptPayload(newPath);
-                if (payload == null)
-                {
-                    Log($"  Recovery failed: {err}");
-                    return (null, null, null);
-                }
-
-                Log($"  Recovery succeeded: clean payload deployed ({payload.Length} bytes)");
-                return (newPath, payload, iv);
-            }
-            catch (Exception ex)
-            {
-                Log($"  Recovery failed: {ex.Message}");
-                return (null, null, null);
             }
         }
 
@@ -1144,6 +1114,52 @@ namespace CloudRedirect.Services.Patching
                 tStart, tEnd, gStart, gEnd, _verbose ? _log : null);
         }
 
+        PatchEntry[] AppendManifestEndpointPatches(byte[] payload, PatchEntry[] existing)
+        {
+            var (ep, ua) = ReadManifestEndpointSetting();
+            if (string.IsNullOrWhiteSpace(ep) || string.IsNullOrWhiteSpace(ua))
+                return existing;
+
+            if (!ResolvePayloadSections(payload, out _, out int tStart, out int tEnd, out _, out _))
+                return existing;
+
+            var extra = Signatures.BuildManifestEndpointPatches(
+                payload, ep!.Trim(), ua!.Trim(),
+                tStart, tEnd, 0, payload.Length,
+                _verbose ? _log : null);
+
+            if (extra == null) return existing;
+
+            var combined = new PatchEntry[existing.Length + extra.Length];
+            existing.CopyTo(combined, 0);
+            extra.CopyTo(combined, existing.Length);
+            return combined;
+        }
+
+        static (string? endpoint, string? userAgent) ReadManifestEndpointSetting()
+        {
+            try
+            {
+                var configDir = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    "CloudRedirect");
+                var path = System.IO.Path.Combine(configDir, "settings.json");
+                if (!System.IO.File.Exists(path)) return (null, null);
+                var json = System.IO.File.ReadAllText(path);
+                using var doc = System.Text.Json.JsonDocument.Parse(json);
+                string? ep = null, ua2 = null;
+                if (doc.RootElement.TryGetProperty("manifest_endpoint", out var epVal) &&
+                    epVal.ValueKind == System.Text.Json.JsonValueKind.String)
+                    ep = epVal.GetString();
+                if (doc.RootElement.TryGetProperty("manifest_user_agent", out var uaVal) &&
+                    uaVal.ValueKind == System.Text.Json.JsonValueKind.String)
+                    ua2 = uaVal.GetString();
+                return (ep, ua2);
+            }
+            catch { }
+            return (null, null);
+        }
+
         CloudRedirectResolveResult ResolveCloudRedirectPatchOffsets(byte[] payload)
         {
             if (!ResolvePayloadSections(payload, out var sections, out int tStart, out int tEnd, out int gStart, out int gEnd))
@@ -1354,30 +1370,6 @@ namespace CloudRedirect.Services.Patching
                 }
 
                 var resolved = ResolveCloudRedirectPatchOffsets(afterP123);
-
-                // Payload may be corrupted by a prior CR version; try the embedded copy.
-                if (resolved == null)
-                {
-                    var (recPath, recPayload, recIv) = TryRecoverCorruptedPayload(cachePath);
-                    if (recPath != null)
-                    {
-                        cachePath = recPath;
-                        payload = recPayload;
-                        iv = recIv;
-
-                        // Re-run P1/P2/P3 on the fresh payload.
-                        resolvedPayload = ResolvePayloadPatchOffsets(payload);
-                        afterP123 = payload;
-                        if (resolvedPayload != null)
-                        {
-                            var (p, a, s, e) = ApplyPatches(payload, resolvedPayload);
-                            if (e.Count == 0) afterP123 = p;
-                        }
-
-                        resolved = ResolveCloudRedirectPatchOffsets(afterP123);
-                    }
-                }
-
                 if (resolved == null)
                     return result.Fail("Could not locate CloudRedirect patch sites in payload");
 

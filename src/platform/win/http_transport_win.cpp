@@ -31,6 +31,15 @@ public:
         return true;
     }
 
+    // Scale send/receive timeouts with body size so multi-MB PUTs survive a slow link
+    // without making small requests wait on the 10s session default.
+    static void TuneTimeoutsForBody(HINTERNET hReq, size_t bodyBytes) {
+        if (bodyBytes <= 256 * 1024) return; // small requests keep the fast default
+        int sendMs = 60000;    // allow a multi-MB body to finish uploading
+        int receiveMs = 30000; // allow Drive to commit and reply
+        WinHttpSetTimeouts(hReq, 5000, 5000, sendMs, receiveMs);
+    }
+
     void Shutdown() override {
         if (m_session) {
             WinHttpCloseHandle(m_session);
@@ -65,6 +74,7 @@ public:
                                       WINHTTP_ADDREQ_FLAG_ADD);
         }
 
+        TuneTimeoutsForBody(hReq, body.size());
         BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             body.empty() ? nullptr : (void*)body.data(), (DWORD)body.size(),
             (DWORD)body.size(), 0);
@@ -78,6 +88,7 @@ public:
                 WINHTTP_HEADER_NAME_BY_INDEX, &code, &codeLen, WINHTTP_NO_HEADER_INDEX);
             resp.status = (int)code;
             ReadBody(hReq, resp.body);
+            ReadLocationHeader(hReq, resp.location);
         }
 
         WinHttpCloseHandle(hReq);
@@ -131,6 +142,7 @@ public:
         }
 
         HttpResp resp;
+        TuneTimeoutsForBody(hReq, body.size());
         BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             body.empty() ? nullptr : (void*)body.data(), (DWORD)body.size(),
             (DWORD)body.size(), 0);
@@ -144,6 +156,7 @@ public:
                 WINHTTP_HEADER_NAME_BY_INDEX, &code, &codeLen, WINHTTP_NO_HEADER_INDEX);
             resp.status = (int)code;
             ReadBody(hReq, resp.body);
+            ReadLocationHeader(hReq, resp.location);
         }
 
         WinHttpCloseHandle(hReq);
@@ -227,6 +240,24 @@ public:
     }
 
 private:
+    void ReadLocationHeader(HINTERNET hReq, std::string& location) {
+        DWORD size = 0;
+        WinHttpQueryHeaders(hReq, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX,
+            WINHTTP_NO_OUTPUT_BUFFER, &size, WINHTTP_NO_HEADER_INDEX);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || size == 0) return;
+        std::wstring wLoc(size / sizeof(wchar_t), 0);
+        if (!WinHttpQueryHeaders(hReq, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX,
+                wLoc.data(), &size, WINHTTP_NO_HEADER_INDEX)) return;
+        while (!wLoc.empty() && wLoc.back() == 0) wLoc.pop_back();
+        if (wLoc.empty()) return;
+        int n = WideCharToMultiByte(CP_UTF8, 0, wLoc.c_str(), (int)wLoc.size(),
+                                     nullptr, 0, nullptr, nullptr);
+        if (n <= 0) return;
+        location.resize(n);
+        WideCharToMultiByte(CP_UTF8, 0, wLoc.c_str(), (int)wLoc.size(),
+                             location.data(), n, nullptr, nullptr);
+    }
+
     void ReadBody(HINTERNET hReq, std::string& body) {
         DWORD avail, got;
         while (WinHttpQueryDataAvailable(hReq, &avail) && avail > 0) {

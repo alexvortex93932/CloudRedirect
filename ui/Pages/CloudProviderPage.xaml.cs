@@ -16,6 +16,13 @@ public partial class CloudProviderPage : Page
     private bool _loading;
     private readonly StringBuilder _logBuffer = new();
 
+    // Upload in-flight cap (MB). Only shown/saved for Google Drive.
+    private const int InFlightDefaultMb = 24;
+    private const int InFlightMinMb = 24;
+    private const int InFlightMaxMb = 64;
+    // Suppresses the slider ValueChanged handler during programmatic load.
+    private bool _inFlightLoading;
+
     public CloudProviderPage()
     {
         InitializeComponent();
@@ -24,15 +31,7 @@ public partial class CloudProviderPage : Page
             try { await LoadCurrentConfigAsync(); }
             catch { }
         };
-        // Cancel in-flight OAuth when the user navigates away mid-auth.
-        // Without this, the loopback HTTP listener in OAuthService keeps
-        // running until the user closes their browser tab (or forever if
-        // they don't), the auth state machine continuation keeps `this`
-        // alive via the closure, and the per-message log callback
-        // (msg => Dispatcher.BeginInvoke(...)) keeps marshaling work onto
-        // a detached LogOutput. Cancelling _authCts triggers the existing
-        // finally block in SignIn_Click which disposes _oauth + _authCts
-        // and resets the UI state.
+        // Cancel in-flight OAuth on Unloaded to stop the loopback listener and prevent leaked references.
         Unloaded += (_, _) =>
         {
             if (_isAuthenticating)
@@ -40,31 +39,18 @@ public partial class CloudProviderPage : Page
         };
     }
 
-    /// <summary>
-    /// Snapshot of everything LoadCurrentConfigAsync gathers off the UI
-    /// thread. Pre-resolving the default local path here means the
-    /// dispatcher continuation never has to fall back to a synchronous
-    /// FindSteamPath() (registry + file probes) on Loaded.
-    /// </summary>
+    /// <summary>Off-thread config snapshot for LoadCurrentConfigAsync.</summary>
     private sealed record LoadedConfigSnapshot(
         Services.CloudConfig? Config,
         string DefaultLocalPath,
         string PathTextOverride,
-        Services.TokenStatus? TokenStatus);
+        Services.TokenStatus? TokenStatus,
+        int UploadInFlightMb);
 
-    // M14: Move SteamDetector.ReadConfig + FindSteamPath + OAuth token
-    // status check off the UI thread. Loaded used to call them
-    // synchronously; on a slow disk or stalled DPAPI prompt that froze
-    // the dispatcher long enough for the page to render with a blank
-    // status line. We now resolve the snapshot in Task.Run and apply it
-    // to controls in the dispatcher continuation, mirroring
-    // DashboardPage.LoadStatusAsync.
+    // M14: Read config + token status off UI thread to avoid disk/DPAPI stall.
     private async Task LoadCurrentConfigAsync()
     {
-        // _loading must be true the entire time we touch ProviderCombo /
-        // TokenPathBox so the SelectionChanged handler doesn't fire
-        // user-gesture branches against a partially-initialized UI. Set
-        // it on the UI thread before launching the I/O.
+        // Set _loading before I/O to suppress SelectionChanged during init.
         _loading = true;
         try
         {
@@ -89,7 +75,7 @@ public partial class CloudProviderPage : Page
                 if (config?.TokenPath != null)
                     tokenStatus = Services.OAuthService.CheckTokenStatus(config.TokenPath);
 
-                return new LoadedConfigSnapshot(config, defaultLocal, pathOverride, tokenStatus);
+                return new LoadedConfigSnapshot(config, defaultLocal, pathOverride, tokenStatus, ReadUploadInFlightMb());
             });
 
             ApplyLoadedSnapshot(snapshot);
@@ -106,12 +92,15 @@ public partial class CloudProviderPage : Page
 
     private void ApplyLoadedSnapshot(LoadedConfigSnapshot snap)
     {
+        ApplyUploadInFlight(snap.UploadInFlightMb);
+
         if (snap.Config == null)
         {
             AuthStatus.Text = S.Get("CloudProvider_NoConfigFound");
-            ProviderCombo.SelectedIndex = 3; // Local only
+            ProviderCombo.SelectedIndex = 2; // Folder / Mapped Drive (default local path)
             if (!string.IsNullOrEmpty(snap.DefaultLocalPath))
                 TokenPathBox.Text = snap.DefaultLocalPath;
+            UpdateProviderUI();
             return;
         }
 
@@ -172,13 +161,23 @@ public partial class CloudProviderPage : Page
                     Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                     "CloudRedirect", "onedrive_tokens.json");
             }
-            else if (tag is "local" or "folder")
+            else if (tag == "folder")
             {
                 SetDefaultLocalPath();
             }
         }
 
         UpdateAuthStatus();
+        // Persist the provider switch (and the path it just set).
+        _ = SaveConfigSilent();
+    }
+
+    // Auto-save manual path edits when the field loses focus, rather than on
+    // every keystroke.
+    private void TokenPathBox_LostFocus(object sender, RoutedEventArgs e)
+    {
+        if (_loading) return;
+        _ = SaveConfigSilent();
     }
 
     /// <summary>
@@ -191,12 +190,13 @@ public partial class CloudProviderPage : Page
         var tag = item.Tag as string;
         bool needsTokens = tag is "gdrive" or "onedrive";
         bool isFolder = tag == "folder";
-        bool isLocal = tag == "local";
         bool needsPath = needsTokens || isFolder;
 
         TokenPathBox.IsEnabled = needsPath;
         BrowseButton.IsEnabled = needsPath;
         SignInButton.Visibility = needsTokens ? Visibility.Visible : Visibility.Collapsed;
+        // Upload in-flight cap is a Google Drive-only throttle.
+        UploadInFlightSection.Visibility = tag == "gdrive" ? Visibility.Visible : Visibility.Collapsed;
 
         // Update labels based on provider type
         if (isFolder)
@@ -204,14 +204,6 @@ public partial class CloudProviderPage : Page
             PathLabel.Text = S.Get("CloudProvider_SyncFolderPath");
             TokenPathBox.PlaceholderText = S.Get("CloudProvider_SyncFolderPlaceholder");
             PathHint.Text = S.Get("CloudProvider_SyncFolderHint");
-        }
-        else if (isLocal)
-        {
-            PathLabel.Text = S.Get("CloudProvider_LocalStoragePath");
-            TokenPathBox.PlaceholderText = "";
-            PathHint.Text = S.Get("CloudProvider_LocalStorageHint");
-            TokenPathBox.IsEnabled = false;
-            BrowseButton.IsEnabled = false;
         }
         else if (needsTokens)
         {
@@ -225,6 +217,10 @@ public partial class CloudProviderPage : Page
             TokenPathBox.PlaceholderText = "";
             PathHint.Text = "";
         }
+
+        // Only reserve space for the hint when it actually has text.
+        PathHint.Visibility = string.IsNullOrEmpty(PathHint.Text)
+            ? Visibility.Collapsed : Visibility.Visible;
     }
 
     private void BrowseToken_Click(object sender, RoutedEventArgs e)
@@ -246,6 +242,7 @@ public partial class CloudProviderPage : Page
             {
                 TokenPathBox.Text = dialog.FolderName;
                 UpdateAuthStatus();
+                _ = SaveConfigSilent();
             }
         }
         else
@@ -261,6 +258,7 @@ public partial class CloudProviderPage : Page
             {
                 TokenPathBox.Text = dialog.FileName;
                 UpdateAuthStatus();
+                _ = SaveConfigSilent();
             }
         }
     }
@@ -270,7 +268,7 @@ public partial class CloudProviderPage : Page
         if (_isAuthenticating) return;
 
         var provider = GetSelectedProvider();
-        if (provider is "local" or "folder") return;
+        if (provider == "folder") return;
 
         var tokenPath = TokenPathBox.Text?.Trim();
         if (string.IsNullOrEmpty(tokenPath))
@@ -284,7 +282,6 @@ public partial class CloudProviderPage : Page
         _authCts = new CancellationTokenSource();
         _oauth = new Services.OAuthService();
 
-        // Update UI state
         SignInButton.IsEnabled = false;
         CancelAuthButton.Visibility = Visibility.Visible;
         ProviderCombo.IsEnabled = false;
@@ -337,17 +334,6 @@ public partial class CloudProviderPage : Page
         // after the async operation observes cancellation.
     }
 
-    private async void SaveConfig_Click(object sender, RoutedEventArgs e)
-    {
-        if (await SaveConfigSilent())
-        {
-            await Services.Dialog.ShowInfoAsync(S.Get("CloudProvider_Saved"), S.Get("CloudProvider_SavedMessage"));
-        }
-    }
-
-    /// <summary>
-    /// Writes config.json without showing a dialog. Returns true on success.
-    /// </summary>
     private async Task<bool> SaveConfigSilent()
     {
         var configDir = Services.SteamDetector.GetConfigDir();
@@ -357,12 +343,6 @@ public partial class CloudProviderPage : Page
         var provider = GetSelectedProvider();
         var tokenPath = TokenPathBox.Text?.Trim() ?? "";
 
-        // "local" in the UI maps to "folder" provider in the DLL with the
-        // default localcloud path, so the DLL has a concrete storage location.
-        var configProvider = provider;
-        if (provider == "local")
-            configProvider = "folder";
-
         var configPath = Path.Combine(configDir, "config.json");
 
         try
@@ -371,10 +351,10 @@ public partial class CloudProviderPage : Page
                 new[] { "provider", "sync_path", "token_path" },
                 writer =>
                 {
-                    writer.WriteString("provider", configProvider);
-                    if (configProvider == "folder")
+                    writer.WriteString("provider", provider);
+                    if (provider == "folder")
                         writer.WriteString("sync_path", tokenPath);
-                    else if (configProvider is not "local")
+                    else
                         writer.WriteString("token_path", tokenPath);
                 });
             return true;
@@ -389,8 +369,8 @@ public partial class CloudProviderPage : Page
     private string GetSelectedProvider()
     {
         if (ProviderCombo.SelectedItem is ComboBoxItem item)
-            return item.Tag as string ?? "local";
-        return "local";
+            return item.Tag as string ?? "folder";
+        return "folder";
     }
 
     private void UpdateAuthStatus(Services.TokenStatus? preCheckedStatus = null)
@@ -398,17 +378,6 @@ public partial class CloudProviderPage : Page
         if (ProviderCombo.SelectedItem is not ComboBoxItem item) return;
 
         var tag = item.Tag as string;
-
-        if (tag == "local")
-        {
-            var localPath = TokenPathBox.Text?.Trim();
-            if (!string.IsNullOrEmpty(localPath))
-                AuthStatus.Text = S.Format("CloudProvider_LocalModeStored", localPath);
-            else
-                AuthStatus.Text = S.Get("CloudProvider_LocalModeNoSync");
-            AuthIcon.Symbol = Wpf.Ui.Controls.SymbolRegular.ShieldCheckmark24;
-            return;
-        }
 
         if (tag == "folder")
         {
@@ -439,17 +408,62 @@ public partial class CloudProviderPage : Page
             return;
         }
 
-        // Caller (the Loaded path) may pass a status that was already
-        // resolved off the UI thread; otherwise we hit DPAPI + file I/O
-        // synchronously. The user-gesture callers (Browse, provider
-        // switch, post-OAuth) accept the synchronous cost in exchange
-        // for keeping their flow simple -- those events are already
-        // tied to a click and the user has paid attention.
+        // preCheckedStatus avoids sync DPAPI/file I/O on Loaded; user-gesture callers accept sync cost.
         var status = preCheckedStatus ?? Services.OAuthService.CheckTokenStatus(tokenPath);
         AuthStatus.Text = status.Message;
         AuthIcon.Symbol = status.IsAuthenticated
             ? Wpf.Ui.Controls.SymbolRegular.ShieldCheckmark24
             : Wpf.Ui.Controls.SymbolRegular.ShieldKeyhole24;
+    }
+
+    /// <summary>Reads upload_inflight_mb from config.json, clamped 24..64.
+    /// Absent/invalid -> the 24 MB default. Off the UI thread.</summary>
+    private static int ReadUploadInFlightMb()
+    {
+        try
+        {
+            var path = Services.SteamDetector.GetConfigFilePath();
+            if (!File.Exists(path)) return InFlightDefaultMb;
+
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            if (doc.RootElement.TryGetProperty("upload_inflight_mb", out var inf) && inf.TryGetInt32(out var mb))
+                return Math.Clamp(mb, InFlightMinMb, InFlightMaxMb);
+        }
+        catch { }
+        return InFlightDefaultMb;
+    }
+
+    private void ApplyUploadInFlight(int mb)
+    {
+        _inFlightLoading = true;
+        try
+        {
+            UploadInFlightSlider.Value = Math.Clamp(mb, InFlightMinMb, InFlightMaxMb);
+            UpdateUploadInFlightValueLabel();
+        }
+        finally { _inFlightLoading = false; }
+    }
+
+    private void UploadInFlightSlider_Changed(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        UpdateUploadInFlightValueLabel();
+        if (_inFlightLoading) return;
+        SaveUploadInFlight();
+    }
+
+    private void UpdateUploadInFlightValueLabel()
+    {
+        if (UploadInFlightValue != null)
+            UploadInFlightValue.Text = S.Format("CloudProvider_UploadInFlightValue", (int)UploadInFlightSlider.Value);
+    }
+
+    /// <summary>Persists upload_inflight_mb (clamped 24..64) into config.json.</summary>
+    private void SaveUploadInFlight()
+    {
+        int mb = Math.Clamp((int)Math.Round(UploadInFlightSlider.Value), InFlightMinMb, InFlightMaxMb);
+        Services.ConfigHelper.SaveConfig(Services.SteamDetector.GetConfigFilePath(),
+            new[] { "upload_inflight_mb" },
+            writer => writer.WriteNumber("upload_inflight_mb", mb));
     }
 
     private void AppendLog(string message)

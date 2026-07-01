@@ -15,9 +15,14 @@ public partial class SettingsPage : Page
 {
     private const string ReleasesUrl = "https://github.com/Selectively11/CloudRedirect/releases";
 
-    private string? _latestDownloadUrl;
     private bool _languageLoading;
     private bool _syncLoading;
+    private bool _modeLoading;
+    /// <summary>Current app mode ("cloud_redirect" or "stfixer"); controls
+    /// which toggles are visible and how saves are scoped.</summary>
+    private string? _mode;
+    /// <summary>Client type ("steamtools" or "thirdparty"); read from settings.json.</summary>
+    private string? _clientType;
     /// <summary>
     /// Index of the last LanguageOptions entry that was successfully
     /// persisted to settings.json. Used to roll back the combo if a
@@ -25,9 +30,6 @@ public partial class SettingsPage : Page
     /// language different from what's actually on disk.
     /// </summary>
     private int _lastSavedLanguageIndex;
-    /// <summary>
-    /// Language options: display key -> culture code (or "system").
-    /// </summary>
     private static readonly (string ResourceKey, string Code)[] LanguageOptions =
     [
         ("Settings_SystemDefault", "system"),
@@ -47,39 +49,38 @@ public partial class SettingsPage : Page
         };
     }
 
-    /// <summary>
-    /// Snapshot of everything LoadSettingsAsync gathers off the UI thread.
-    /// All disk reads (settings.json language, settings.json mode,
-    /// config.json sync toggles) happen in Task.Run; the dispatcher
-    /// continuation only mutates controls.
-    /// </summary>
+    /// <summary>Off-thread snapshot of settings.json + config.json state.</summary>
     private sealed record SettingsSnapshot(
         string Language,
         string? Mode,
+        string? ClientType,
         bool? SyncAchievements,
         bool? SyncPlaytime,
         bool? SyncLuas,
         bool? AutoUpdateDll,
+        bool? ShowNonSteamGame,
         bool? ParentalIgnorePlaytime,
-        bool? ParentalBypassPlaytime);
+        bool? ParentalBypassPlaytime,
+        bool? SchemaFetch);
 
-    // M15: Move language/mode/sync-toggle config reads off the UI thread.
-    // Loaded used to call ReadLanguageSetting + ReadModeSetting +
-    // LoadSyncToggles synchronously, which can stall on a slow disk
-    // (network drive, AV scan). Mirror DashboardPage.LoadStatusAsync:
-    // gather a snapshot in Task.Run, apply controls afterward.
+    // M15: Read config off UI thread to avoid slow-disk stall.
     private async Task LoadSettingsAsync()
     {
         var snapshot = await Task.Run(() =>
         {
             var lang = ReadLanguageSetting();
             var mode = Services.SteamDetector.ReadModeSetting();
+            var clientType = ReadClientTypeSetting();
 
-            bool? a = null, p = null, l = null, u = null, pip = null, pbp = null;
+            bool? a = null, p = null, l = null, u = null, nsg = null, pip = null, pbp = null, sf = null;
             if (mode == "cloud_redirect")
-                ReadSyncTogglesInto(ref a, ref p, ref l, ref u, ref pip, ref pbp);
+                ReadSyncTogglesInto(ref a, ref p, ref l, ref u, ref nsg, ref pip, ref pbp, ref sf);
+            else
+                // STFixer mode exposes achievements, "Show Lua Game in Status" and
+                // the Steam Family toggles; leave the cloud-only toggles untouched.
+                ReadStFixerTogglesInto(ref sf, ref nsg, ref pip, ref pbp);
 
-            return new SettingsSnapshot(lang, mode, a, p, l, u, pip, pbp);
+            return new SettingsSnapshot(lang, mode, clientType, a, p, l, u, nsg, pip, pbp, sf);
         });
 
         ApplySettingsSnapshot(snapshot);
@@ -88,19 +89,35 @@ public partial class SettingsPage : Page
     private void ApplySettingsSnapshot(SettingsSnapshot snap)
     {
         ApplyLanguageSelector(snap.Language);
+        _mode = snap.Mode;
+        _clientType = snap.ClientType;
+        ApplyModeSelector(snap.Mode);
 
-        ParentalSection.Visibility = Visibility.Visible;
+        bool isThirdParty = snap.ClientType == "thirdparty";
+
+        // Third-party clients don't use ST, so hide ST-specific features.
+        ShowNonSteamGameCard.Visibility = isThirdParty ? Visibility.Collapsed : Visibility.Visible;
+        SyncLuasCard.Visibility = isThirdParty ? Visibility.Collapsed : Visibility.Visible;
+
+        // Hide mode switcher for third-party (stfixer is ST-specific).
+        ModeCard.Visibility = isThirdParty ? Visibility.Collapsed : Visibility.Visible;
+
+        ExtraSection.Visibility = Visibility.Visible;
+        AchievementsSection.Visibility = Visibility.Visible;
+
         if (snap.Mode == "cloud_redirect")
         {
-            SyncSection.Visibility = Visibility.Visible;
+            ExperimentalSection.Visibility = Visibility.Visible;
+
             ApplySyncToggles(snap.SyncAchievements, snap.SyncPlaytime, snap.SyncLuas, snap.AutoUpdateDll,
-                             snap.ParentalIgnorePlaytime, snap.ParentalBypassPlaytime);
+                             snap.ShowNonSteamGame, snap.ParentalIgnorePlaytime, snap.ParentalBypassPlaytime,
+                             snap.SchemaFetch);
         }
         else
         {
-            SyncSection.Visibility = Visibility.Collapsed;
-            ApplySyncToggles(false, false, false, false,
-                             snap.ParentalIgnorePlaytime, snap.ParentalBypassPlaytime);
+            ExperimentalSection.Visibility = Visibility.Collapsed;
+            ApplySyncToggles(false, false, false, snap.AutoUpdateDll, snap.ShowNonSteamGame,
+                             snap.ParentalIgnorePlaytime, snap.ParentalBypassPlaytime, snap.SchemaFetch);
         }
     }
 
@@ -129,8 +146,72 @@ public partial class SettingsPage : Page
         }
     }
 
+    private void ApplyModeSelector(string? mode)
+    {
+        _modeLoading = true;
+        try
+        {
+            // Default to ST Fixer when no mode is set yet.
+            var target = mode == "cloud_redirect" ? "cloud_redirect" : "stfixer";
+            for (int i = 0; i < ModeComboBox.Items.Count; i++)
+            {
+                if (ModeComboBox.Items[i] is ComboBoxItem item && item.Tag as string == target)
+                {
+                    ModeComboBox.SelectedIndex = i;
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            _modeLoading = false;
+        }
+    }
+
+    private async void ModeComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_modeLoading) return;
+        if (ModeComboBox.SelectedItem is not ComboBoxItem item) return;
+
+        var target = item.Tag as string ?? "stfixer";
+        if (target == _mode) return;
+
+        // Switching into Cloud Redirect shows the consent dialog once, ever.
+        if (target == "cloud_redirect" && !Services.ModeService.HasAcceptedDisclaimer())
+        {
+            var disclaimer = new Windows.DisclaimerWindow { Owner = Window.GetWindow(this) };
+            if (disclaimer.ShowDialog() != true || !disclaimer.Accepted)
+            {
+                ApplyModeSelector(_mode); // revert combo
+                return;
+            }
+            Services.ModeService.MarkDisclaimerAccepted();
+        }
+
+        bool cloudEnabled = target == "cloud_redirect";
+        try
+        {
+            Services.ModeService.PersistMode(target, cloudEnabled);
+        }
+        catch (Exception ex)
+        {
+            ApplyModeSelector(_mode); // revert combo on failure
+            await Services.Dialog.ShowErrorAsync(
+                S.Get("Common_Error"),
+                S.Format("Choice_FailedSaveMode", ex.Message));
+            return;
+        }
+
+        _mode = target;
+        var mw = Window.GetWindow(this) as MainWindow;
+        mw?.ApplyMode(target);
+        // Re-read settings so this page's sections reflect the new mode.
+        try { await LoadSettingsAsync(); } catch { }
+    }
+
     private void ApplySyncToggles(bool? achievements, bool? playtime, bool? luas, bool? autoUpdateDll,
-                                   bool? parentalIgnorePlaytime, bool? parentalBypassPlaytime)
+                                   bool? showNonSteamGame, bool? parentalIgnorePlaytime, bool? parentalBypassPlaytime,
+                                   bool? schemaFetch)
     {
         _syncLoading = true;
         try
@@ -139,8 +220,10 @@ public partial class SettingsPage : Page
             if (playtime == true) SyncPlaytimeToggle.IsChecked = true;
             if (luas == true) SyncLuasToggle.IsChecked = true;
             if (autoUpdateDll == true) AutoUpdateDllToggle.IsChecked = true;
+            if (showNonSteamGame == true) ShowNonSteamGameToggle.IsChecked = true;
             if (parentalIgnorePlaytime == true) ParentalIgnorePlaytimeToggle.IsChecked = true;
             if (parentalBypassPlaytime == true) ParentalBypassPlaytimeToggle.IsChecked = true;
+            if (schemaFetch == true) GetAchievementDataToggle.IsChecked = true;
         }
         finally
         {
@@ -148,13 +231,10 @@ public partial class SettingsPage : Page
         }
     }
 
-    /// <summary>
-    /// Reads the sync toggle booleans from config.json on the calling
-    /// thread. Used by LoadSettingsAsync inside Task.Run so the dispatcher
-    /// path never opens config.json synchronously.
-    /// </summary>
+    /// <summary>Reads sync toggles from config.json (called inside Task.Run).</summary>
     private static void ReadSyncTogglesInto(ref bool? achievements, ref bool? playtime, ref bool? luas, ref bool? autoUpdateDll,
-                                              ref bool? parentalIgnorePlaytime, ref bool? parentalBypassPlaytime)
+                                              ref bool? showNonSteamGame, ref bool? parentalIgnorePlaytime, ref bool? parentalBypassPlaytime,
+                                              ref bool? schemaFetch)
     {
         try
         {
@@ -175,6 +255,50 @@ public partial class SettingsPage : Page
                 autoUpdateDll = u.ValueKind == JsonValueKind.True;
             else
                 autoUpdateDll = true; // default on when key absent
+            if (root.TryGetProperty("show_non_steam_game", out var nsg))
+                showNonSteamGame = nsg.ValueKind == JsonValueKind.True;
+            else
+                showNonSteamGame = true; // default on when key absent
+            if (root.TryGetProperty("parental_ignore_playtime", out var pip) && pip.ValueKind == JsonValueKind.True)
+                parentalIgnorePlaytime = true;
+            if (root.TryGetProperty("parental_bypass_playtime", out var pbp) && pbp.ValueKind == JsonValueKind.True)
+                parentalBypassPlaytime = true;
+            // Schema fetch: default ON when key absent (matches DLL default).
+            if (root.TryGetProperty("schema_fetch", out var sf2) && sf2.ValueKind == JsonValueKind.False)
+                schemaFetch = false;
+            else if (root.TryGetProperty("experimental_schema_fetch", out var sf) && sf.ValueKind == JsonValueKind.False)
+                schemaFetch = false;
+            else
+                schemaFetch = true;
+        }
+        catch { }
+    }
+
+    /// <summary>Reads STFixer-mode toggles from config.json. schema_fetch/show_non_steam_game default ON; parental toggles default OFF.</summary>
+    private static void ReadStFixerTogglesInto(ref bool? schemaFetch, ref bool? showNonSteamGame,
+                                               ref bool? parentalIgnorePlaytime, ref bool? parentalBypassPlaytime)
+    {
+        try
+        {
+            var path = GetConfigPath();
+            if (!File.Exists(path)) { schemaFetch = true; showNonSteamGame = true; return; }
+
+            var json = File.ReadAllText(path);
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("schema_fetch", out var sf2) && sf2.ValueKind == JsonValueKind.False)
+                schemaFetch = false;
+            else if (root.TryGetProperty("experimental_schema_fetch", out var sf) && sf.ValueKind == JsonValueKind.False)
+                schemaFetch = false;
+            else
+                schemaFetch = true;
+
+            if (root.TryGetProperty("show_non_steam_game", out var nsg))
+                showNonSteamGame = nsg.ValueKind == JsonValueKind.True;
+            else
+                showNonSteamGame = true; // default on when key absent
+
             if (root.TryGetProperty("parental_ignore_playtime", out var pip) && pip.ValueKind == JsonValueKind.True)
                 parentalIgnorePlaytime = true;
             if (root.TryGetProperty("parental_bypass_playtime", out var pbp) && pbp.ValueKind == JsonValueKind.True)
@@ -183,8 +307,34 @@ public partial class SettingsPage : Page
         catch { }
     }
 
+    private static string? ReadClientTypeSetting()
+    {
+        try
+        {
+            var path = System.IO.Path.Combine(SteamDetector.GetConfigDir(), "settings.json");
+            if (!File.Exists(path)) return null;
+            var json = File.ReadAllText(path);
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("client_type", out var ct) &&
+                ct.ValueKind == JsonValueKind.String)
+                return ct.GetString();
+        }
+        catch { }
+        return null;
+    }
+
     private void LoadAbout()
     {
+        // Use informational version (has pre-release suffix); strip build metadata; fall back to assembly version.
+        var informational = Assembly.GetExecutingAssembly()
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (!string.IsNullOrEmpty(informational))
+        {
+            var plus = informational.IndexOf('+');
+            VersionText.Text = plus >= 0 ? informational.Substring(0, plus) : informational;
+            return;
+        }
+
         var version = Assembly.GetExecutingAssembly().GetName().Version;
         VersionText.Text = version != null
             ? S.Format("Settings_VersionFormat", version.Major, version.Minor, version.Build)
@@ -265,7 +415,6 @@ public partial class SettingsPage : Page
         if (!Directory.Exists(dir))
             Directory.CreateDirectory(dir);
 
-        // Read existing settings to preserve other fields
         JsonElement existing = default;
         if (File.Exists(path))
         {
@@ -284,7 +433,6 @@ public partial class SettingsPage : Page
             writer.WriteStartObject();
             writer.WriteString("language", code);
 
-            // Copy any other properties from the existing file
             if (existing.ValueKind == JsonValueKind.Object)
             {
                 foreach (var prop in existing.EnumerateObject())
@@ -333,82 +481,44 @@ public partial class SettingsPage : Page
         }
     }
 
-    /// <summary>
-    /// Persists the three sync toggles into config.json via ConfigHelper
-    /// (which preserves caller-unowned keys and atomic-writes). Throws on
-    /// real I/O failure so the caller can revert UI state and surface
-    /// the error.
-    /// </summary>
+    /// <summary>Persists sync toggles to config.json; throws on I/O failure for caller to revert.</summary>
     private void SaveSyncToggles()
     {
         var path = GetConfigPath();
+
+        // Scope the save to keys owned by visible controls; persisting hidden toggles
+        // would clobber the user's cloud_redirect-mode settings.
+        if (_mode != "cloud_redirect")
+        {
+            Services.ConfigHelper.SaveConfig(path,
+                new[] { "auto_update_dll", "schema_fetch", "experimental_schema_fetch", "show_non_steam_game",
+                        "parental_ignore_playtime", "parental_bypass_playtime" },
+                writer =>
+                {
+                    writer.WriteBoolean("auto_update_dll", AutoUpdateDllToggle.IsChecked == true);
+                    writer.WriteBoolean("schema_fetch", GetAchievementDataToggle.IsChecked == true);
+                    writer.WriteBoolean("show_non_steam_game", ShowNonSteamGameToggle.IsChecked == true);
+                    writer.WriteBoolean("parental_ignore_playtime", ParentalIgnorePlaytimeToggle.IsChecked == true);
+                    writer.WriteBoolean("parental_bypass_playtime", ParentalBypassPlaytimeToggle.IsChecked == true);
+                });
+            return;
+        }
+
         Services.ConfigHelper.SaveConfig(path,
             new[] { "sync_achievements", "sync_playtime", "sync_luas", "auto_update_dll",
-                    "parental_ignore_playtime", "parental_bypass_playtime" },
+                    "show_non_steam_game", "parental_ignore_playtime", "parental_bypass_playtime",
+                    "schema_fetch", "experimental_schema_fetch" },
             writer =>
             {
                 writer.WriteBoolean("sync_achievements", SyncAchievementsToggle.IsChecked == true);
                 writer.WriteBoolean("sync_playtime", SyncPlaytimeToggle.IsChecked == true);
                 writer.WriteBoolean("sync_luas", SyncLuasToggle.IsChecked == true);
                 writer.WriteBoolean("auto_update_dll", AutoUpdateDllToggle.IsChecked == true);
+                writer.WriteBoolean("show_non_steam_game", ShowNonSteamGameToggle.IsChecked == true);
                 writer.WriteBoolean("parental_ignore_playtime", ParentalIgnorePlaytimeToggle.IsChecked == true);
                 writer.WriteBoolean("parental_bypass_playtime", ParentalBypassPlaytimeToggle.IsChecked == true);
+                writer.WriteBoolean("schema_fetch", GetAchievementDataToggle.IsChecked == true);
             });
-    }
-
-    private async void CheckForUpdates_Click(object sender, RoutedEventArgs e)
-    {
-        UpdateButton.IsEnabled = false;
-        UpdateButton.Content = S.Get("Settings_Checking");
-        UpdateStatusText.Text = S.Get("Settings_ContactingGitHub");
-        DownloadButton.Visibility = Visibility.Collapsed;
-        _latestDownloadUrl = null;
-
-        try
-        {
-            var result = await AppUpdater.CheckAsync();
-
-            if (result == null)
-            {
-                UpdateHeaderText.Text = S.Get("Settings_CheckForUpdates");
-                UpdateStatusText.Text = S.Format("Settings_FailedToCheck", "no response from GitHub");
-                return;
-            }
-
-            var localVersion = Assembly.GetExecutingAssembly().GetName().Version;
-            var local3 = localVersion != null
-                ? new Version(localVersion.Major, localVersion.Minor, localVersion.Build)
-                : new Version(0, 0, 0);
-
-            if (result.UpdateAvailable)
-            {
-                UpdateHeaderText.Text = S.Format("Settings_UpdateAvailableFormat", result.TagName ?? "");
-                UpdateStatusText.Text = S.Format("Settings_NewerVersionAvailable", local3);
-                _latestDownloadUrl = ReleasesUrl;
-                DownloadButton.Visibility = Visibility.Visible;
-            }
-            else
-            {
-                UpdateHeaderText.Text = S.Get("Settings_UpToDate");
-                UpdateStatusText.Text = S.Format("Settings_LatestVersionFormat", local3);
-            }
-        }
-        catch (Exception ex)
-        {
-            UpdateHeaderText.Text = S.Get("Settings_CheckForUpdates");
-            UpdateStatusText.Text = S.Format("Settings_FailedToCheck", ex.Message);
-        }
-        finally
-        {
-            UpdateButton.IsEnabled = true;
-            UpdateButton.Content = S.Get("Settings_Check");
-        }
-    }
-
-    private void DownloadUpdate_Click(object sender, RoutedEventArgs e)
-    {
-        var url = _latestDownloadUrl ?? ReleasesUrl;
-        Process.Start(new ProcessStartInfo(url) { UseShellExecute = true })?.Dispose();
     }
 
     private async void ResetData_Click(object sender, RoutedEventArgs e)

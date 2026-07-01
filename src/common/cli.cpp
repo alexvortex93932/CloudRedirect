@@ -17,6 +17,11 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <algorithm>
+#include <unordered_set>
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -438,6 +443,131 @@ std::string CmdListBlobs(const std::string& provider, const std::string& account
     });
 }
 
+// Search cloud for all stats.json files; returns JSON array of {account_id, app_id, content}.
+std::string CmdListAllStats(const std::string& provider) {
+    std::string tokenPath = GetTokenPath(provider);
+    if (tokenPath.empty()) {
+        return JsonError("Cannot determine config directory");
+    }
+
+    auto prov = CreateCloudProvider(provider);
+    if (!prov) {
+        return JsonError("Unknown provider: " + provider);
+    }
+    if (!prov->Init(tokenPath)) {
+        return JsonError("Failed to initialize provider");
+    }
+    if (!prov->IsAuthenticated()) {
+        prov->Shutdown();
+        return JsonError("Not authenticated");
+    }
+
+    bool supported = false;
+    auto hits = prov->SearchByName("stats.json", &supported);
+    prov->Shutdown();
+
+    if (!supported) {
+        return JsonError("Search not supported for provider: " + provider);
+    }
+
+    // Stats sync as one account-wide blob at <accountId>/0/stats.json; legacy
+    // installs keep per-app files. Expand the blob per app and de-dupe (account
+    // blob wins). Account scope lives under synthetic appId 0 (kAccountScopeAppId).
+    const std::string accountScope = "0";
+    std::unordered_set<std::string> seen;  // "<account>/<app>"
+    std::ostringstream apps;
+    apps << "[";
+    bool first = true;
+
+    auto emit = [&](const std::string& accountId, const std::string& appId,
+                    const std::string& content) {
+        if (!seen.insert(accountId + "/" + appId).second) return;
+        if (!first) apps << ",";
+        apps << JsonObject({
+            {"account_id", JsonString(accountId)},
+            {"app_id", JsonString(appId)},
+            {"content", JsonString(content)}
+        });
+        first = false;
+    };
+
+    // Pass 1: account-scope blobs first so they win de-dup over legacy files.
+    // Pass 2: legacy per-app blobs for un-migrated apps.
+    for (int pass = 0; pass < 2; ++pass) {
+        for (const auto& h : hits) {
+            // h.path is "<accountId>/<appId>/stats.json".
+            size_t s1 = h.path.find('/');
+            if (s1 == std::string::npos) continue;
+            size_t s2 = h.path.find('/', s1 + 1);
+            if (s2 == std::string::npos) continue;
+            std::string accountId = h.path.substr(0, s1);
+            std::string appId = h.path.substr(s1 + 1, s2 - s1 - 1);
+            bool isAccountBlob = (appId == accountScope);
+            if (isAccountBlob != (pass == 0)) continue;
+            std::string content(
+                reinterpret_cast<const char*>(h.content.data()), h.content.size());
+
+            if (isAccountBlob) {
+                // {"<appId>": {stats...}} -> one entry per app.
+                Json::Value root = Json::Parse(content);
+                if (root.type != Json::Type::Object) continue;
+                for (const auto& [appIdStr, appVal] : root.objVal) {
+                    if (appIdStr == accountScope) continue;
+                    emit(accountId, appIdStr, Json::Stringify(appVal));
+                }
+            } else {
+                emit(accountId, appId, content);
+            }
+        }
+    }
+    apps << "]";
+    return std::string("{\"success\":true,\"apps\":") + apps.str() + "}";
+}
+
+std::string CmdDownloadBlob(const std::string& provider, const std::string& accountId,
+                            const std::string& appId, const std::string& blobName) {
+    std::string tokenPath = GetTokenPath(provider);
+    if (tokenPath.empty()) {
+        return JsonError("Cannot determine config directory");
+    }
+
+    auto prov = CreateCloudProvider(provider);
+    if (!prov) {
+        return JsonError("Unknown provider: " + provider);
+    }
+
+    if (!prov->Init(tokenPath)) {
+        return JsonError("Failed to initialize provider");
+    }
+
+    if (!prov->IsAuthenticated()) {
+        prov->Shutdown();
+        return JsonError("Not authenticated");
+    }
+
+    // Metadata-text blobs (e.g. stats.json) live at <accountId>/<appId>/<name>
+    // and are stored uncompressed, so the raw download is the literal content.
+    std::string path = accountId + "/" + appId + "/" + blobName;
+    std::vector<uint8_t> data;
+    bool ok = prov->Download(path, data);
+    prov->Shutdown();
+
+    if (!ok) {
+        return JsonObject({
+            {"success", JsonBool(false)},
+            {"found", JsonBool(false)},
+            {"error", JsonString("Blob not found")}
+        });
+    }
+
+    std::string content(reinterpret_cast<const char*>(data.data()), data.size());
+    return JsonObject({
+        {"success", JsonBool(true)},
+        {"found", JsonBool(true)},
+        {"content", JsonString(content)}
+    });
+}
+
 std::string CmdDeleteBlobs(const std::string& provider, const std::string& accountId, const std::string& appId,
                            const std::vector<std::string>& blobNames) {
     std::string tokenPath = GetTokenPath(provider);
@@ -775,6 +905,8 @@ static void PrintUsage() {
     fprintf(stderr, "  list-remote-app-files <provider> <account_id> <app_id>  List every file path in one remote app\n");
     fprintf(stderr, "  delete-remote-app <provider> <account_id> <app_id>  Delete app from cloud\n");
     fprintf(stderr, "  list-blobs <provider> <account_id> <app_id>  List blob files in app\n");
+    fprintf(stderr, "  download-blob <provider> <account_id> <app_id> <blob>  Download a single blob's content\n");
+    fprintf(stderr, "  list-all-stats <provider>  Search the cloud for every app's stats.json\n");
     fprintf(stderr, "  delete-blobs <provider> <account_id> <app_id> <blob>...  Delete specific blobs\n");
     fprintf(stderr, "  sync-remote-app <provider> <account_id> <app_id> <cloud_root>  Run SyncFromCloud for one app\n");
     fprintf(stderr, "  sync-all-remote-apps <provider> <account_id> <cloud_root>  Run SyncAllFromCloud for one account\n");
@@ -835,6 +967,20 @@ int RunCli(int argc, char** argv) {
             return 1;
         }
         result = CmdListBlobs(argv[3], argv[4], argv[5]);
+    }
+    else if (strcmp(command, "download-blob") == 0) {
+        if (argc < 7) {
+            fprintf(stderr, "Error: download-blob requires <provider> <account_id> <app_id> <blob>\n");
+            return 1;
+        }
+        result = CmdDownloadBlob(argv[3], argv[4], argv[5], argv[6]);
+    }
+    else if (strcmp(command, "list-all-stats") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "Error: list-all-stats requires <provider>\n");
+            return 1;
+        }
+        result = CmdListAllStats(argv[3]);
     }
     else if (strcmp(command, "delete-blobs") == 0) {
         if (argc < 7) {

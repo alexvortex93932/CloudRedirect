@@ -286,6 +286,9 @@ void Backend::loadConfig()
     m_providerName = obj.value("provider").toString("local");
     m_syncFolderPath = obj.value("sync_folder_path").toString();
     m_notificationsEnabled = obj.value("notifications_enabled").toBool(true);
+    m_statsSyncEnabled = obj.value("stats_sync_enabled").toBool(true);
+    m_syncAchievements = obj.value("sync_achievements").toBool(false);
+    m_syncPlaytime = obj.value("sync_playtime").toBool(false);
     fprintf(stderr, "[Backend] loadConfig: provider=%s syncFolder=%s notifications=%s\n",
         m_providerName.toUtf8().constData(), m_syncFolderPath.toUtf8().constData(),
         m_notificationsEnabled ? "true" : "false");
@@ -354,6 +357,9 @@ void Backend::saveConfig()
     obj["provider"] = m_providerName;
     obj["sync_folder_path"] = m_syncFolderPath;
     obj["notifications_enabled"] = m_notificationsEnabled;
+    obj["stats_sync_enabled"] = m_statsSyncEnabled;
+    obj["sync_achievements"] = m_syncAchievements;
+    obj["sync_playtime"] = m_syncPlaytime;
 
     // Atomic write: write to temp, then rename
     QString tempPath = configPath + ".tmp";
@@ -405,6 +411,31 @@ void Backend::setNotificationsEnabled(bool enabled)
 {
     if (m_notificationsEnabled == enabled) return;
     m_notificationsEnabled = enabled;
+    saveConfig();
+}
+
+bool Backend::statsSyncEnabled() const { return m_statsSyncEnabled; }
+void Backend::setStatsSyncEnabled(bool enabled)
+{
+    if (m_statsSyncEnabled == enabled) return;
+    m_statsSyncEnabled = enabled;
+    saveConfig();
+    emit settingsChanged();
+}
+
+bool Backend::syncAchievements() const { return m_syncAchievements; }
+void Backend::setSyncAchievements(bool enabled)
+{
+    if (m_syncAchievements == enabled) return;
+    m_syncAchievements = enabled;
+    saveConfig();
+}
+
+bool Backend::syncPlaytime() const { return m_syncPlaytime; }
+void Backend::setSyncPlaytime(bool enabled)
+{
+    if (m_syncPlaytime == enabled) return;
+    m_syncPlaytime = enabled;
     saveConfig();
 }
 
@@ -1543,10 +1574,41 @@ void Backend::checkForFlatpakUpdate()
     if (!remotes.contains("cloudredirect"))
         return;
 
-    QString updates = runFlatpakHostCommand({"remote-ls", "--user", "--updates", "--app", "cloudredirect"});
-    if (updates.contains("org.cloudredirect.CloudRedirect")) {
-        emit flatpakUpdateAvailable();
+    // Get remote version and compare against running version
+    QString info = runFlatpakHostCommand({"remote-info", "--user", "cloudredirect", "org.cloudredirect.CloudRedirect"});
+    QString remoteVersion;
+    for (const QString &line : info.split('\n')) {
+        if (line.trimmed().startsWith("Version:")) {
+            remoteVersion = line.mid(line.indexOf(':') + 1).trimmed();
+            break;
+        }
     }
+
+    if (remoteVersion.isEmpty())
+        return;
+
+    // Compare versions: only notify if remote is strictly newer
+    QString current = QCoreApplication::applicationVersion();
+    auto parseVer = [](const QString &v) -> QList<int> {
+        // Strip prerelease suffix (e.g. "-TEST4") for comparison
+        QString base = v.section('-', 0, 0);
+        QList<int> parts;
+        for (const QString &p : base.split('.'))
+            parts.append(p.toInt());
+        while (parts.size() < 3) parts.append(0);
+        return parts;
+    };
+
+    QList<int> rv = parseVer(remoteVersion);
+    QList<int> cv = parseVer(current);
+    bool remoteNewer = false;
+    for (int i = 0; i < 3; ++i) {
+        if (rv[i] > cv[i]) { remoteNewer = true; break; }
+        if (rv[i] < cv[i]) break;
+    }
+
+    if (remoteNewer)
+        emit flatpakUpdateAvailable();
 }
 
 void Backend::applyFlatpakUpdate()

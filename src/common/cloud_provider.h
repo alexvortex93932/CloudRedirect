@@ -30,8 +30,11 @@ public:
         std::vector<uint8_t> data;
     };
 
+    // Contract: implementations MUST CAS-skip existing blobs (per-file dedup).
+    // Skip only on definite Exists; on Missing/Error, upload (CAS is idempotent).
     virtual bool UploadBatch(const std::vector<UploadItem>& items) {
         for (const auto& item : items) {
+            if (CheckExists(item.path) == ExistsStatus::Exists) continue;
             if (!Upload(item.path, item.data.data(), item.data.size()))
                 return false;
         }
@@ -79,6 +82,20 @@ public:
         outFiles = List(prefix);
         if (outComplete) *outComplete = true;
         return true;
+    }
+
+    // A blob found by a global filename search: its full relative path
+    // ("{accountId}/{appId}/{filename}") and content.
+    struct SearchHit {
+        std::string path;
+        std::vector<uint8_t> content;
+    };
+
+    // Search account for exact filename matches. Default: unsupported (callers fall back to listing).
+    virtual std::vector<SearchHit> SearchByName(const std::string& /*filename*/,
+                                                bool* outSupported = nullptr) {
+        if (outSupported) *outSupported = false;
+        return {};
     }
 };
 

@@ -44,6 +44,7 @@ internal static class EmbeddedBundledPayload
     {
         try
         {
+
             var dst = Fingerprint.GetExpectedCachePath(steamPath);
             var dstDir = Path.GetDirectoryName(dst);
             if (!string.IsNullOrEmpty(dstDir))

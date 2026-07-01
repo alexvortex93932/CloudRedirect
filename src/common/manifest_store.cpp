@@ -661,6 +661,12 @@ ManifestDelta ComputeManifestDelta(uint32_t accountId, uint32_t appId,
     ManifestDelta delta;
     delta.serverCN = serverCN;
 
+    // serverCN < clientCN: cloud is behind (failed batch). Return empty delta so
+    // Steam doesn't overwrite newer local saves.
+    if (serverCN < clientCN) {
+        return delta;  // empty files → caller serves empty delta (0 files)
+    }
+
     bool snapshotExists = ManifestSnapshotExists(accountId, appId, clientCN);
     Manifest baseline = snapshotExists
         ? LoadManifestSnapshotInternal(accountId, appId, clientCN)

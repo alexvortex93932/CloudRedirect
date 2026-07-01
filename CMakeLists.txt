@@ -9,10 +9,13 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 file(READ "${CMAKE_SOURCE_DIR}/Version.props" VERSION_PROPS_CONTENT)
 string(REGEX MATCH "<ReleaseVersion>([^<]+)</ReleaseVersion>" _ "${VERSION_PROPS_CONTENT}")
 set(CR_RELEASE_VERSION "${CMAKE_MATCH_1}")
+string(REGEX MATCH "<ReleasePrerelease>([^<]*)</ReleasePrerelease>" _ "${VERSION_PROPS_CONTENT}")
+set(CR_PRERELEASE "${CMAKE_MATCH_1}")
 
 if(NOT CR_RELEASE_VERSION)
     set(CR_RELEASE_VERSION "0.0.0")
 endif()
+set(CR_RELEASE_VERSION "${CR_RELEASE_VERSION}${CR_PRERELEASE}")
 
 # ── Generate version string with git SHA ────────────────────────────────
 # Release builds may pass -DCR_GIT_SHA to pin the build id (e.g. when the build
@@ -51,8 +54,8 @@ set(CR_SO_VERSION "${CR_RELEASE_VERSION}+${GIT_SHA}")
 set(COMMON_SOURCES
     src/common/protobuf.cpp
     src/common/json.cpp
+    src/common/coop_yield.cpp
     src/common/vdf.cpp
-    src/common/bkv_stats.cpp
     src/common/remotecache_repair.cpp
     src/common/manifest_store.cpp
     src/common/app_state.cpp
@@ -69,10 +72,11 @@ set(COMMON_SOURCES
     src/common/cli.cpp
     src/common/cloud_provider_base.cpp
     src/common/autocloud_scan.cpp
-    src/common/autocloud_bootstrap.cpp
     src/common/steam_kv_injector.cpp
     src/common/parental_bypass.cpp
     src/common/metadata_sync.cpp
+    src/common/stats_store.cpp
+    src/common/stats_handlers.cpp
     src/common/miniz.c
     src/common/miniz_tdef.c
     src/common/miniz_tinfl.c
@@ -107,6 +111,12 @@ else()
         src/platform/linux/vtable_hook.cpp
         src/platform/linux/cloud_hooks.cpp
         src/platform/linux/cloud_intercept.cpp
+        src/platform/linux/stats_hooks.cpp
+        src/platform/linux/gamesplayed_hook.cpp
+        src/platform/linux/live_playtime.cpp
+        src/platform/linux/achievement_inject.cpp
+        src/platform/linux/schema_fetch.cpp
+        src/platform/linux/recvpkt_hook.cpp
         src/platform/linux/http_transport_linux.cpp
         src/platform/linux/token_store_linux.cpp
         src/platform/linux/log.cpp
@@ -151,12 +161,19 @@ if(WIN32)
     target_link_libraries(cloud_redirect_cli PRIVATE Shell32 Ole32)
     # Ensure DLL is built before CLI
     add_dependencies(cloud_redirect_cli cloud_redirect)
+
+    # Standalone Steam Cloud file manager for a single AppID (default 760).
+    # Self-contained: resolves the steam_api64.dll flat exports at runtime, so it
+    # needs no Steamworks SDK headers/libs. steam_api64.dll must sit next to it.
+    add_executable(cloud760_tool
+        src/platform/win/cloud760_tool.cpp
+    )
 else()
     target_include_directories(cloud_redirect PRIVATE src/platform/linux)
     target_link_libraries(cloud_redirect PRIVATE dl pthread)
     # Steam on Linux is 32-bit; use LINUX_32BIT=ON when cross-compiling on 64-bit host
     # Match Steam's pre-C++11 ABI
-    target_compile_definitions(cloud_redirect PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
+    target_compile_definitions(cloud_redirect PRIVATE _GLIBCXX_USE_CXX11_ABI=0 _FILE_OFFSET_BITS=64)
     if(LINUX_32BIT)
         target_compile_options(cloud_redirect PRIVATE -m32)
         target_link_options(cloud_redirect PRIVATE -m32)
@@ -200,6 +217,7 @@ endif()
 enable_testing()
 
 if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
+    add_compile_definitions(CR_RELEASE_VERSION="${CR_RELEASE_VERSION}")
     if(WIN32)
         add_executable(autocloud_native_tests
             tests/autocloud_native_tests.cpp
@@ -235,15 +253,6 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
     target_include_directories(remotecache_repair_tests PRIVATE src/common)
     add_test(NAME remotecache_repair_tests COMMAND remotecache_repair_tests)
 
-    if(EXISTS ${CMAKE_SOURCE_DIR}/tests/bkv_stats_tests.cpp)
-        add_executable(bkv_stats_tests
-            tests/bkv_stats_tests.cpp
-            src/common/bkv_stats.cpp
-        )
-        target_include_directories(bkv_stats_tests PRIVATE src/common)
-        add_test(NAME bkv_stats_tests COMMAND bkv_stats_tests)
-    endif()
-
     add_executable(rpc_handlers_tests
         tests/rpc_handlers_tests.cpp
         src/common/protobuf.cpp
@@ -272,6 +281,7 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
         src/common/legacy_metadata_cleanup.cpp
         src/common/manifest_store.cpp
         src/common/app_state.cpp
+        src/common/coop_yield.cpp
         src/common/token_store.cpp
         src/common/cloud_staging.cpp
         src/common/pending_ops_journal.cpp
@@ -346,15 +356,50 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
     )
     target_include_directories(vdf_tests PRIVATE src/common)
     add_test(NAME vdf_tests COMMAND vdf_tests)
+
+    add_executable(stats_store_tests
+        tests/stats_store_tests.cpp
+        src/common/stats_store.cpp
+        src/common/json.cpp
+        src/common/metadata_sync.cpp
+        src/common/vdf.cpp
+    )
+    target_include_directories(stats_store_tests PRIVATE src/common)
+    if(WIN32)
+        target_include_directories(stats_store_tests PRIVATE src/platform/win)
+        target_sources(stats_store_tests PRIVATE
+            src/platform/win/log.cpp
+            src/platform/win/platform_win.cpp
+        )
+        target_link_libraries(stats_store_tests PRIVATE Shlwapi Advapi32 Crypt32 Shell32 Ole32)
+    else()
+        target_include_directories(stats_store_tests PRIVATE src/platform/linux)
+        target_sources(stats_store_tests PRIVATE
+            src/platform/linux/log.cpp
+            src/platform/linux/platform_linux.cpp
+            src/platform/linux/file_util.cpp
+        )
+        target_link_libraries(stats_store_tests PRIVATE pthread dl)
+    endif()
+    add_test(NAME stats_store_tests COMMAND stats_store_tests)
 endif()
 
 # ── UI (Windows only) ───────────────────────────────────────────────────
 
 if(WIN32)
+    # The csproj expects the DLL/CLI at ../build/Release/; copy from the actual
+    # build output dir so out-of-tree builds (build-win) work correctly.
     add_custom_target(ui ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/build/Release"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:cloud_redirect>"
+            "${CMAKE_SOURCE_DIR}/build/Release/cloud_redirect.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:cloud_redirect_cli>"
+            "${CMAKE_SOURCE_DIR}/build/Release/cloud_redirect_cli.exe"
         COMMAND dotnet publish -c Release -r win-x64 --self-contained false -o bin/publish
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/ui
         COMMENT "Publishing CloudRedirect UI"
-        DEPENDS cloud_redirect
+        DEPENDS cloud_redirect cloud_redirect_cli
     )
 endif()

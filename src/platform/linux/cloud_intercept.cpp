@@ -267,6 +267,11 @@ bool HasNamespaceApps() {
     return !g_namespaceApps.empty();
 }
 
+std::vector<uint32_t> GetNamespaceApps() {
+    std::lock_guard<std::mutex> lock(g_nsMutex);
+    return std::vector<uint32_t>(g_namespaceApps.begin(), g_namespaceApps.end());
+}
+
 std::string GetSteamPath() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_steamPath.empty())
@@ -290,23 +295,10 @@ void SetSteamPath(const std::string& path) {
         g_steamPath += '/';
 }
 
-void RecordLaunchTime(uint32_t /*appId*/) {
-    // TODO: implement playtime tracking on Linux
-}
-
 void Shutdown() {
     int fd = g_watcherFd.exchange(-1, std::memory_order_acq_rel);
     if (fd != -1) close(fd);
     LOG("[Linux] CloudIntercept shutdown");
-}
-
-// Playtime restoration stubs (called from rpc_handlers.cpp)
-bool RestorePlaytimeState(uint32_t /*appId*/, uint64_t /*playtime*/, uint64_t /*playtime2wks*/) {
-    return false;
-}
-
-bool RestoreLastPlayedState(uint32_t /*appId*/, uint64_t /*lastPlayed*/) {
-    return false;
 }
 
 } // namespace CloudIntercept

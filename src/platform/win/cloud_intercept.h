@@ -34,6 +34,7 @@ void InstallManifestPinHook();
 
 // Stub -- release-state patching removed from public builds.
 void InstallReleaseStateNop();
+void InstallGamesPlayedHook();
 
 // compute payload base and set up cave replacement buffer globals
 void SetSendPktAddr(void* recvPktGlobalAddr);
@@ -49,15 +50,20 @@ void SetAccountId(uint32_t accountId);
 // get the Steam installation path (with trailing backslash)
 const std::string& GetSteamPath();
 
-// record the launch timestamp for internal playtime tracking
-void RecordLaunchTime(uint32_t appId);
-
 void AddNamespaceApp(uint32_t appId);
 void RemoveNamespaceApp(uint32_t appId);
 bool IsNamespaceApp(uint32_t appId);
 // outAdded/outRemoved may be null.
 void SetNamespaceApps(const uint32_t* appIds, uint32_t count,
                       size_t* outAdded, size_t* outRemoved);
+
+// Install vtable hooks on CClientUnifiedServiceTransport (for third-party consumers).
+void InstallServiceMethodHook();
+bool VtableHookInstalled();
+
+// Deferred stats seeding for third-party consumers (CR_SetApps triggers it).
+void SetNeedsSeed(bool v);
+void TriggerDeferredSeed(const std::vector<uint32_t>& apps);
 
 // signal shutdown
 void Shutdown();

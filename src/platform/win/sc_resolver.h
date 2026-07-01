@@ -36,6 +36,23 @@ struct ResolvedAddrs {
     uintptr_t getAppMinutesPlayedData;    // CUser playtime record getter
     uintptr_t flushAppMinutesPlayed;      // CUser playtime record flush
     uintptr_t setAppLastPlayedTime;       // CUser last-played-time setter
+    uintptr_t playtimeWriter;             // CUser playtime response writer
+
+    // ── Protobuf message infrastructure ──────────────────────────────
+    uintptr_t bAsyncSend;                 // CProtoBufMsg::BAsyncSend
+    uintptr_t pbMsgCtor;                  // CProtoBufMsgBase::ctor
+    uintptr_t pbMsgFinalize;              // CProtoBufMsgBase::finalize (allocate typed body)
+    uintptr_t pbMsgCleanup;              // CProtoBufMsgBase::cleanup (dtor)
+    uintptr_t yieldIfTimeSlice;           // CJob::BYieldIfTimeSlice
+
+    // ── Schema fetch ─────────────────────────────────────────────────
+    uintptr_t getUserStatsDesc;           // CMsgClientGetUserStats body descriptor ptr
+    uintptr_t getUserStatsVtable;         // CProtoBufMsg<CMsgClientGetUserStats> vtable
+
+    // ── Playtime response wrappers ───────────────────────────────────
+    uintptr_t respDescriptor;             // CPlayer_GetLastPlayedTimes_Response descriptor ptr
+    uintptr_t respWrapperVtable;          // CProtoBufMsg<...Response> vtable
+    uintptr_t regKeySyncTime;             // pointer to "LastPlayedTimesSyncTime" registry key string
 
     // ── Struct offsets (0 = not resolved) ──────────────────────────────
     uint32_t engineOffJobMgr;             // CSteamEngine -> CJobMgr

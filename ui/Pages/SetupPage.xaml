@@ -14,7 +14,27 @@
             <TextBlock x:Name="DescriptionText"
                        Text="{res:Loc Setup_Description}"
                        Foreground="{DynamicResource TextFillColorSecondaryBrush}"
-                       Margin="0,0,0,24" />
+                       Margin="0,0,0,16" />
+
+            <!-- Client type selector: pick before deploying -->
+            <StackPanel x:Name="ClientTypeSelector" Margin="0,0,0,16">
+                <StackPanel Orientation="Horizontal">
+                    <RadioButton x:Name="RadioSteamTools"
+                                 Content="{res:Loc Setup_ClientType_ST}"
+                                 GroupName="ClientType"
+                                 Margin="0,0,16,0"
+                                 Checked="RadioSteamTools_Checked" />
+                    <RadioButton x:Name="RadioThirdParty"
+                                 GroupName="ClientType"
+                                 Checked="RadioThirdParty_Checked" />
+                </StackPanel>
+                <TextBlock x:Name="ClientTypeWarning"
+                           Foreground="#FFAA00"
+                           FontSize="12"
+                           TextWrapping="Wrap"
+                           Margin="0,6,0,0"
+                           Visibility="Collapsed" />
+            </StackPanel>
 
             <ui:Button x:Name="RunAllButton"
                        Content="{res:Loc Setup_RunAllPatches}"
@@ -24,6 +44,7 @@
                        Padding="24,10"
                        HorizontalAlignment="Stretch"
                        Margin="0,0,0,24"
+                       IsEnabled="False"
                        Click="RunAll_Click" />
 
             <TextBlock Text="{res:Loc Setup_LogOutput}"
@@ -53,6 +74,34 @@
                              Text="{res:Loc Setup_Ready}" />
                 </ScrollViewer>
             </Border>
+
+            <!-- Manifest endpoint override (ST-only) -->
+            <StackPanel x:Name="ManifestEndpointSection" Margin="0,0,0,16">
+                <TextBlock Text="Manifest Endpoint"
+                           FontSize="20" FontWeight="SemiBold"
+                           Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                           Margin="0,0,0,8" />
+                <TextBlock Text="Override the manifest download URL and User-Agent used by SteamTools. Leave empty to use the default."
+                           Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                           TextWrapping="Wrap"
+                           Margin="0,0,0,12" />
+
+                <TextBlock Text="Endpoint URL"
+                           Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                           Margin="0,0,0,4" />
+                <ui:TextBox x:Name="ManifestEndpointBox"
+                            PlaceholderText="https://example.com/manifest/"
+                            Margin="0,0,0,12"
+                            LostFocus="ManifestEndpoint_LostFocus" />
+
+                <TextBlock Text="User-Agent"
+                           Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                           Margin="0,0,0,4" />
+                <ui:TextBox x:Name="ManifestUserAgentBox"
+                            PlaceholderText="MyClient/1.0"
+                            Margin="0,0,0,8"
+                            LostFocus="ManifestEndpoint_LostFocus" />
+            </StackPanel>
 
             <!-- Diagnostics toggle -->
             <ui:CardControl Margin="0,0,0,8">
@@ -99,6 +148,9 @@
                                Icon="{ui:SymbolIcon FolderOpen24}"
                                Click="BrowseSteamDir_Click" />
                 </ui:CardControl>
+
+                <!-- ST-only sections (hidden in thirdparty mode) -->
+                <StackPanel x:Name="STOnlySection">
 
                 <TextBlock Text="{res:Loc Setup_OfflineSetupHeader}"
                            FontSize="20" FontWeight="SemiBold"
@@ -211,6 +263,9 @@
                                Visibility="Collapsed"
                                Click="PatchRevert_Click" />
                 </WrapPanel>
+
+                </StackPanel>
+                <!-- End ST-only sections -->
 
                 <TextBlock Text="{res:Loc Setup_DeployHeader}"
                            FontSize="20" FontWeight="SemiBold"
