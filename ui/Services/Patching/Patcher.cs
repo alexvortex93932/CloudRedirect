@@ -1120,13 +1120,13 @@ namespace CloudRedirect.Services.Patching
             if (string.IsNullOrWhiteSpace(ep) || string.IsNullOrWhiteSpace(ua))
                 return existing;
 
-            if (!ResolvePayloadSections(payload, out _, out int tStart, out int tEnd, out _, out _))
+            if (!ResolvePayloadSections(payload, out var sections, out int tStart, out int tEnd, out _, out _))
                 return existing;
 
             var extra = Signatures.BuildManifestEndpointPatches(
                 payload, ep!.Trim(), ua!.Trim(),
                 tStart, tEnd, 0, payload.Length,
-                _verbose ? _log : null);
+                sections, _verbose ? _log : null);
 
             if (extra == null) return existing;
 

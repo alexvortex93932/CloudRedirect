@@ -638,7 +638,7 @@ namespace CloudRedirect.Services.Patching
         public static PatchEntry[]? BuildManifestEndpointPatches(
             byte[] payload, string url, string userAgent,
             int textStart, int textEnd, int globalStart, int globalEnd,
-            Action<string>? log)
+            PeSection[] sections, Action<string>? log)
         {
             var urlBytes = System.Text.Encoding.ASCII.GetBytes(url);
             var uaBytes = System.Text.Encoding.ASCII.GetBytes(userAgent);
@@ -697,11 +697,16 @@ namespace CloudRedirect.Services.Patching
 
             // P8b: replace 51-byte slist block with lea r8→UA, CURLOPT_USERAGENT setopt, perform, nops.
 
-            // Compute RIP-relative displacement from lea to UA string.
-            int leaAddr = p8bHit;              // address of lea instruction
-            int leaEnd = leaAddr + 7;          // RIP after lea (7-byte instruction)
-            int uaAddr = p8aHit + uaOffset;    // absolute address of UA string
-            int disp = uaAddr - leaEnd;
+            // Cross-section lea: use RVAs since .text and .rdata can have different gaps.
+            int leaRva = PeSection.FileOffsetToRva(sections, p8bHit);
+            int uaRva = PeSection.FileOffsetToRva(sections, p8aHit + uaOffset);
+            if (leaRva < 0 || uaRva < 0)
+            {
+                log?.Invoke($"  P8b: RVA resolution failed (lea=0x{p8bHit:X}->{leaRva:X}, ua=0x{p8aHit + uaOffset:X}->{uaRva:X})");
+                return null;
+            }
+            int leaEndRva = leaRva + 7;        // RIP after lea (7-byte instruction)
+            int disp = uaRva - leaEndRva;
 
             // Extract setopt/perform call targets from old layout (offsets differ if already patched).
             int setoptRel, performRel;
@@ -718,10 +723,10 @@ namespace CloudRedirect.Services.Patching
                 int setoptTarget = setoptCallEnd + setoptRel;
                 int performTarget = performCallEnd + performRel;
                 // New layout: lea r8(7) + mov edx(5) + mov rcx(3) + call setopt(5) = 20
-                int newSetoptCallEnd = leaAddr + 20;
+                int newSetoptCallEnd = p8bHit + 20;
                 setoptRel = setoptTarget - newSetoptCallEnd;
                 // + mov rcx(3) + call perform(5) = 28
-                int newPerformCallEnd = leaAddr + 28;
+                int newPerformCallEnd = p8bHit + 28;
                 performRel = performTarget - newPerformCallEnd;
             }
             else
@@ -736,9 +741,9 @@ namespace CloudRedirect.Services.Patching
                 int setoptTarget = oldSetoptCallEnd + setoptRel;
                 int oldPerformCallEnd = p8bHit + 28;
                 int performTarget = oldPerformCallEnd + performRel;
-                int newSetoptCallEnd = leaAddr + 20;
+                int newSetoptCallEnd = p8bHit + 20;
                 setoptRel = setoptTarget - newSetoptCallEnd;
-                int newPerformCallEnd = leaAddr + 28;
+                int newPerformCallEnd = p8bHit + 28;
                 performRel = performTarget - newPerformCallEnd;
             }
 
