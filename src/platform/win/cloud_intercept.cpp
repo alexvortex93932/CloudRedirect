@@ -5004,8 +5004,139 @@ void InstallManifestPinHook() {
         g_bddOrigAddr, (void*)hookAddr);
 }
 
+// Release-state patch state
+static uint8_t* g_releaseStateAddr = nullptr;
+static uint8_t  g_releaseStateOrig[6] = {};
+static std::atomic<bool> g_releaseStatePatched{false};
+
 void InstallReleaseStateNop() {
-    // Stub -- release-state patching removed from public builds.
+    // Patch GetEffectiveReleaseState to always return 4 (RELEASED).
+    HMODULE hSC = GetModuleHandleA("steamclient64.dll");
+    if (!hSC) return;
+
+    uintptr_t base = reinterpret_cast<uintptr_t>(hSC);
+
+    // Find "ReleaseStateOverride\0" in .rdata to locate the function.
+    static const uint8_t needle[] = "ReleaseStateOverride";
+    char mask[21]; memset(mask, 'x', 20); mask[20] = '\0';
+
+    uintptr_t strAddr = 0;
+    {
+        uintptr_t searchFrom = SigScanner::GetRdataBase();
+        size_t remaining = SigScanner::GetRdataSize();
+        while (remaining > 20) {
+            uintptr_t hit = SigScanner::FindPatternInRange(searchFrom, remaining, needle, mask, 20);
+            if (!hit) break;
+            // Must be exactly "ReleaseStateOverride\0" (not "...Countries")
+            if (*(uint8_t*)(hit + 20) == '\0') {
+                strAddr = hit;
+                break;
+            }
+            size_t advance = (hit - searchFrom) + 1;
+            searchFrom = hit + 1;
+            remaining -= advance;
+        }
+    }
+    if (!strAddr) {
+        LOG("[RelState] 'ReleaseStateOverride' string not found in .rdata");
+        return;
+    }
+
+    uintptr_t textBase = SigScanner::GetTextBase();
+    size_t textSize = SigScanner::GetTextSize();
+
+    // Find LEA xref to the string to get the thunk that populates the global.
+    uintptr_t thunkLeaAddr = 0;
+    __try {
+        const auto* p = reinterpret_cast<const uint8_t*>(textBase);
+        for (size_t i = 0; i + 7 <= textSize; ++i) {
+            if ((p[i] == 0x48 || p[i] == 0x4C) && p[i+1] == 0x8D) {
+                int32_t disp = *reinterpret_cast<const int32_t*>(p + i + 3);
+                uintptr_t target = textBase + i + 7 + disp;
+                if (target == strAddr) {
+                    thunkLeaAddr = textBase + i;
+                    break;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    if (!thunkLeaAddr) {
+        LOG("[RelState] LEA xref to 'ReleaseStateOverride' not found");
+        return;
+    }
+
+    // The LEA after the string ref loads the override global's address.
+    uintptr_t globalAddr = 0;
+    __try {
+        const auto* q = reinterpret_cast<const uint8_t*>(thunkLeaAddr + 7);
+        if ((q[0] == 0x48 || q[0] == 0x4C) && q[1] == 0x8D) {
+            int32_t disp = *reinterpret_cast<const int32_t*>(q + 3);
+            globalAddr = (thunkLeaAddr + 7) + 7 + disp;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    if (!globalAddr) {
+        LOG("[RelState] Could not extract override global address");
+        return;
+    }
+
+    // Find the MOV that reads this global -- that's inside GetEffectiveReleaseState.
+    uintptr_t funcAddr = 0;
+    __try {
+        const auto* p = reinterpret_cast<const uint8_t*>(textBase);
+        for (size_t i = 0; i + 6 <= textSize; ++i) {
+            // 8B 15 xx xx xx xx  = mov edx, [rip+disp32]
+            if (p[i] == 0x8B && p[i+1] == 0x15) {
+                int32_t disp = *reinterpret_cast<const int32_t*>(p + i + 2);
+                uintptr_t target = textBase + i + 6 + disp;
+                if (target == globalAddr) {
+                    // Walk backward to function prologue
+                    uintptr_t ea = textBase + i;
+                    for (int j = 0; j < 128; ++j) {
+                        if (SigScanner::LooksLikeFunctionStart(ea - j)) {
+                            funcAddr = ea - j;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    if (!funcAddr) {
+        LOG("[RelState] GetEffectiveReleaseState not found");
+        return;
+    }
+
+    g_releaseStateAddr = reinterpret_cast<uint8_t*>(funcAddr);
+    memcpy(g_releaseStateOrig, g_releaseStateAddr, 6);
+    LOG("[RelState] GetEffectiveReleaseState at sc+0x%llX, prologue: %02X %02X %02X %02X %02X %02X",
+        (unsigned long long)(funcAddr - base),
+        g_releaseStateOrig[0], g_releaseStateOrig[1], g_releaseStateOrig[2],
+        g_releaseStateOrig[3], g_releaseStateOrig[4], g_releaseStateOrig[5]);
+
+    DWORD oldProt;
+    if (!VirtualProtect(g_releaseStateAddr, 6, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        LOG("[RelState] VirtualProtect failed (%u)", GetLastError());
+        g_releaseStateAddr = nullptr;
+        return;
+    }
+
+    // mov eax, 4; ret
+    g_releaseStateAddr[0] = 0xB8;
+    g_releaseStateAddr[1] = 0x04;
+    g_releaseStateAddr[2] = 0x00;
+    g_releaseStateAddr[3] = 0x00;
+    g_releaseStateAddr[4] = 0x00;
+    g_releaseStateAddr[5] = 0xC3;
+
+    VirtualProtect(g_releaseStateAddr, 6, oldProt, &oldProt);
+    FlushInstructionCache(GetCurrentProcess(), g_releaseStateAddr, 6);
+
+    g_releaseStatePatched.store(true, std::memory_order_release);
+    LOG("[RelState] Patched to return ERELEASESTATE_RELEASED (4)");
 }
 
 // ── BAsyncSend inline detour (GamesPlayed rewriting) ───────────────────
@@ -6419,6 +6550,22 @@ static void ShutdownImpl() {
         }
         g_basOriginal = nullptr;
         g_basOrigAddr = nullptr;
+    }
+
+    // Restore GetEffectiveReleaseState prologue
+    if (g_releaseStateAddr && g_releaseStatePatched.load(std::memory_order_acquire)) {
+        HMODULE currentSC = GetModuleHandleA("steamclient64.dll");
+        if (currentSC) {
+            DWORD oldProt;
+            if (VirtualProtect(g_releaseStateAddr, 6, PAGE_EXECUTE_READWRITE, &oldProt)) {
+                memcpy(g_releaseStateAddr, g_releaseStateOrig, 6);
+                FlushInstructionCache(GetCurrentProcess(), g_releaseStateAddr, 6);
+                VirtualProtect(g_releaseStateAddr, 6, oldProt, &oldProt);
+                LOG("Shutdown: restored GetEffectiveReleaseState prologue");
+            }
+        }
+        g_releaseStatePatched.store(false, std::memory_order_release);
+        g_releaseStateAddr = nullptr;
     }
 
     // Both threads poll g_shuttingDown; 5s is generous. Stuck network I/O

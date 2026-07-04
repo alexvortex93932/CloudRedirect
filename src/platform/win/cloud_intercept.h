@@ -32,7 +32,7 @@ void InstallRecvPktMonitor(void* savedOrigPtrAddr);
 // install inline detour on steamclient64 for manifest pinning
 void InstallManifestPinHook();
 
-// Stub -- release-state patching removed from public builds.
+// Patch GetEffectiveReleaseState to always return RELEASED.
 void InstallReleaseStateNop();
 void InstallGamesPlayedHook();
 
