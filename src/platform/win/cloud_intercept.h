@@ -26,8 +26,8 @@ using RecvPktFn = int64_t(__fastcall*)(void* thisptr, CNetPacket* pkt);
 void Init(const std::string& steamPath, bool cloudSaveOnly = false,
           CR_NotifyFn notifyCallback = nullptr);
 
-// hook the saved-original RecvPkt pointer to monitor incoming packets
-void InstallRecvPktMonitor(void* savedOrigPtrAddr);
+// Inline-detour CCMConnection::RecvPkt in steamclient64.dll via sig-scan.
+void InstallRecvPktDetour();
 
 // install inline detour on steamclient64 for manifest pinning
 void InstallManifestPinHook();
